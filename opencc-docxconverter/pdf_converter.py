@@ -17,12 +17,16 @@ _CJK_SANS_CANDIDATES = [
     r"C:\Windows\Fonts\simhei.ttf",
     r"C:\Windows\Fonts\msyh.ttc",
     r"C:\Windows\Fonts\Deng.ttf",
-    # Linux
+    # Linux：单 face 的 SC 版 otf 优先——CJK 合集 .ttc 的第 0 个 face 是
+    # JP 变体，而 EmbeddedFont/PIL 都无法指定 face，会把部分汉字渲染成日式写法
+    "/usr/share/fonts/noto/NotoSansSC-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
+    "/usr/share/fonts/noto-cjk/NotoSansSC-Regular.otf",
+    "/usr/share/fonts/google-noto-cjk/NotoSansSC-Regular.otf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/noto/NotoSansSC-Regular.otf",
     "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
     "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
     "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
@@ -36,7 +40,11 @@ _CJK_SANS_BOLD_CANDIDATES = [
     # Windows
     r"C:\Windows\Fonts\msyhbd.ttc",
     r"C:\Windows\Fonts\Dengb.ttf",
-    # Linux
+    # Linux：SC 版 otf 优先（原因同上）
+    "/usr/share/fonts/noto/NotoSansSC-Bold.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansSC-Bold.otf",
+    "/usr/share/fonts/noto-cjk/NotoSansSC-Bold.otf",
+    "/usr/share/fonts/google-noto-cjk/NotoSansSC-Bold.otf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
@@ -47,12 +55,15 @@ _CJK_SANS_BOLD_CANDIDATES = [
 _CJK_SERIF_CANDIDATES = [
     # Windows
     r"C:\Windows\Fonts\simsun.ttc",
-    # Linux
+    # Linux：SC 版 otf 优先（原因同黑体）
+    "/usr/share/fonts/noto/NotoSerifSC-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSerifSC-Regular.otf",
+    "/usr/share/fonts/noto-cjk/NotoSerifSC-Regular.otf",
+    "/usr/share/fonts/google-noto-cjk/NotoSerifSC-Regular.otf",
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSerifCJK-Regular.ttc",
     "/usr/share/fonts/noto-cjk/NotoSerifCJK-Regular.ttc",
     "/usr/share/fonts/google-noto-cjk/NotoSerifCJK-Regular.ttc",
-    "/usr/share/fonts/noto/NotoSerifSC-Regular.otf",
     # macOS
     "/System/Library/Fonts/Supplemental/Songti.ttc",
 ]
@@ -60,7 +71,11 @@ _CJK_SERIF_CANDIDATES = [
 _CJK_SERIF_BOLD_CANDIDATES = [
     # Windows
     r"C:\Windows\Fonts\simsunb.ttf",
-    # Linux
+    # Linux：SC 版 otf 优先（原因同上）
+    "/usr/share/fonts/noto/NotoSerifSC-Bold.otf",
+    "/usr/share/fonts/opentype/noto/NotoSerifSC-Bold.otf",
+    "/usr/share/fonts/noto-cjk/NotoSerifSC-Bold.otf",
+    "/usr/share/fonts/google-noto-cjk/NotoSerifSC-Bold.otf",
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
     "/usr/share/fonts/truetype/noto/NotoSerifCJK-Bold.ttc",
     "/usr/share/fonts/noto-cjk/NotoSerifCJK-Bold.ttc",
