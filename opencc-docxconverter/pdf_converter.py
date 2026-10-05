@@ -124,6 +124,23 @@ _LATIN_SERIF_BOLD_CANDIDATES = [
     "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf",
 ]
 
+# 方正字库的 PostScript 缩写名（FZ + 字形缩写 + 末位 K=GBK / J=简体）。
+# 这类名称不含 song/kai 等完整词（如 FZSSK=书宋、FZKTK=楷体、FZFSK=仿宋），
+# 下面的通用关键词匹配不到；方正书版导出的 PDF 普遍使用这批字体，
+# 漏判会把全书（含宋体正文）落到兜底的黑体。
+_FOUNDER_FONT_MAP = [
+    ('fzkt', 'kai'),        # 方正楷体
+    ('fzxk', 'kai'),        # 方正行楷
+    ('fzfs', 'fangsong'),   # 方正仿宋
+    ('fzss', 'serif'),      # 方正书宋
+    ('fzxb', 'serif'),      # 方正小标宋
+    ('fzdb', 'serif'),      # 方正大标宋
+    ('fzht', 'sans'),       # 方正黑体
+    # 方正书版内部字体“白正”（BZ=白正，白体正字，宋体系；书版常用它
+    # 单独渲染标点符号，映射到宋体即可与原书标点风格一致）
+    ('e-bz', 'serif'),
+]
+
 # 原文字体名 -> 风格类别的关键词（按序匹配，先匹配到者生效；
 # 楷体/仿宋的关键词更特殊，需在宋体/黑体之前判断）
 _FONT_CATEGORY_KEYWORDS = [
@@ -145,6 +162,10 @@ def _classify_font_category(font_name: Optional[str]) -> str:
     name = (font_name or '').lower()
     if '+' in name:
         name = name.split('+', 1)[1]
+    # 方正缩写名优先（FZSSK 等不含完整关键词，通用匹配会漏判成黑体）
+    for prefix, category in _FOUNDER_FONT_MAP:
+        if prefix in name:
+            return category
     for category, keywords in _FONT_CATEGORY_KEYWORDS:
         if any(keyword in name for keyword in keywords):
             return category
@@ -385,18 +406,26 @@ _DEFAULT_FONT_NAMES = {
 # 注意：捕获组使 re.split 把拉丁片段保留在结果里，而非作为分隔符丢弃
 _LATIN_RUN_RE = re.compile(r'([\x20-\x7e\u00a0-\u024f\u1e00-\u1eff]+)')
 
+# 拉丁片段中真正的字母/数字：纯标点片段（中文句子里的半角逗号、括号等）
+# 不算西文——源文档里它们是用中文字库渲染的（方正字库 ASCII 标点区即
+# 中文样式字形），落到西文字体会明显变小，需跟随所在片段的中文字体。
+_LATIN_ALNUM_RE = re.compile(r'[0-9A-Za-z\u00c0-\u024f\u1e00-\u1eff]')
+
 
 def _split_by_script(text: str) -> List[Tuple[str, bool]]:
     """
     将文本切分为 (片段, 是否拉丁文) 序列，保持原有顺序。
-    英文/数字/半角符号及带变音符号的拉丁字符使用拉丁字体，
-    其余（中文、全角标点等）使用中文字体。
+    英文/数字及带变音符号的拉丁字符使用拉丁字体，其余（中文、全角标点、
+    中文语境下的半角标点）使用中文字体。
     """
     runs = []
     for part in _LATIN_RUN_RE.split(text):
         if not part:
             continue
-        runs.append((part, _LATIN_RUN_RE.fullmatch(part) is not None))
+        is_latin = _LATIN_RUN_RE.fullmatch(part) is not None
+        if is_latin and not _LATIN_ALNUM_RE.search(part):
+            is_latin = False
+        runs.append((part, is_latin))
     return runs
 
 
@@ -462,6 +491,7 @@ def _char_runs_from_page(doc: PdfDocument, page_index: int,
             threshold = size * (0.20 if latin_pair else 0.30)
             if same_line and gap <= threshold and cur['style'] == style:
                 cur['text'] += char
+                cur['xs'].append(ch.origin_x)
                 cur['w'] = (ch.origin_x + (ch.advance_width or 0.0)) - cur['x']
                 tail = ch
                 merged = True
@@ -477,6 +507,7 @@ def _char_runs_from_page(doc: PdfDocument, page_index: int,
                 'color': ch.color,
                 'bold': bold,
                 'style': style,
+                'xs': [ch.origin_x],
             }
             runs.append(cur)
             tail = ch
@@ -493,16 +524,37 @@ def _char_runs_from_page(doc: PdfDocument, page_index: int,
 # 文本绘制（中英分字体 + 按脚本切分 + 宽度自适应）
 # ---------------------------------------------------------------------------
 
+# 可独立压缩推进宽度的标点（含中文语境的半角标点与全角标点、全角空格）：
+# 闭标点墨迹靠字身框左侧、开标点靠右侧，推进宽度压到半宽左右不会与相邻
+# 文字重叠。破折号/省略号墨迹贯穿整格、源文档也按全角排版，不参与压缩。
+_COMPRESSIBLE_PUNCT_RE = re.compile(
+    r'([，。、；：？！“”‘’《》〈〉（）【】〔〕「」『』·,.;:!?()\u3000]+)')
+
+# 全角开标点（墨迹靠字身框右侧）：推进宽度被压缩后若仍按原位绘制，墨迹
+# 会压到后面的字，需左移使其墨迹右缘对齐单元右界——源文档“标点半角”
+# 正是开标点紧贴后字的效果。
+_OPEN_PUNCT_RE = re.compile(r'[（（《〈“‘【〔「『]')
+_OPEN_PUNCT_INK_RIGHT = 0.9  # 开标点墨迹右缘约占字身框比例（宋体系实测 0.85~0.91）
+
+
 def _draw_text(page_builder, cc, text: str, x: float, y: float, run_w: float,
                font_name: Optional[str], size: float, color, is_bold: bool,
-               fonts: dict) -> bool:
+               fonts: dict, char_xs: Optional[List[float]] = None) -> bool:
     """
     转换一段文本并按脚本分组绘制到指定位置。
 
     - 按原文风格类别（黑体/宋体/楷体/仿宋）匹配输出字体，保留字体区分度
-    - 西文片段按原文风格选择衬线/非衬线拉丁字体
-    - 各片段用 PIL 精确测量宽度，顺序推进绘制位置
-    - 总宽超出原文片段宽度时按比例缩小字号，避免与后续文字重叠
+    - 西文/数字按原文风格选择衬线/非衬线拉丁字体；中文语境下的半角标点
+      跟随中文字体（源文档里它们由中文字库渲染，落到西文字体会明显变小）
+    - 优先逐字按原始坐标绘制（char_xs）：完整保留两端对齐的字距拉伸与
+      方正书版“标点半角”版式——整段按字体自然宽度推进会让段内文字逐渐
+      左漂，在段尾与后一单元之间留下空隙。仅当转换后字符数与原文一致时
+      可用，否则回退到整段重排
+    - 整段重排路径（span 回退、转换改变字符数）中，中文标点独立成段：
+      输出中文字体的标点字身框是全宽的，而源文档标点推进宽度常只有一半，
+      按自然宽度推进会触发缩字号、把标点明显变小。标点单独定位后只压缩
+      其推进宽度（字形保持原字号），开标点再左移使墨迹贴住后字；标点压
+      到半宽仍放不下时才回退为按比例缩小字号
 
     fonts 为 逻辑字体键 -> {'name': 注册名, 'path': 字体文件路径}。
     返回是否实际绘制了内容。
@@ -516,36 +568,85 @@ def _draw_text(page_builder, cc, text: str, x: float, y: float, run_w: float,
     color = color or (0.0, 0.0, 0.0)
 
     category = _classify_font_category(font_name)
+    # 粗体仅在有同族粗体文件时生效，避免为保字重损失字体风格
+    if is_bold and category in ('sans', 'serif'):
+        key = category + '_bold'
+    else:
+        key = category
+    cjk_entry = fonts.get(key) or fonts['sans']
+    # 楷体/仿宋的西文部分按衬线处理（与宋体一致）
+    if category in ('serif', 'kai', 'fangsong'):
+        lkey = 'latin_serif_bold' if is_bold else 'latin_serif'
+    else:
+        lkey = 'latin_sans_bold' if is_bold else 'latin_sans'
+    latin_entry = fonts.get(lkey) or fonts['sans']
 
-    runs = []
+    # --- 逐字定位路径：每个字落在原文坐标上 ---
+    if (char_xs and len(char_xs) == len(converted)
+            and len(char_xs) == len(text)):
+        n = len(char_xs)
+        for i, (ch, cx) in enumerate(zip(converted, char_xs)):
+            draw_x = cx
+            if _OPEN_PUNCT_RE.fullmatch(ch):
+                # 开标点墨迹靠字身框右侧：源单元（到下一字的距离）比全宽
+                # 窄时，左移使墨迹右缘对齐单元右界，贴住后面的字
+                cell = (char_xs[i + 1] - cx if i + 1 < n
+                        else span_w - (cx - char_xs[0]))
+                natural = _measure(ch, cjk_entry['path'], size)
+                if cell > 0 and natural and cell < natural:
+                    draw_x = cx + cell - _OPEN_PUNCT_INK_RIGHT * size
+            if (_LATIN_RUN_RE.fullmatch(ch) and _LATIN_ALNUM_RE.search(ch)):
+                entry = latin_entry
+            else:
+                entry = cjk_entry
+            page_builder.font(entry['name'], size).at(draw_x, y).inline_color(
+                color[0], color[1], color[2], ch)
+        return True
+
+    # --- 整段重排路径 ---
+    segments = []  # [text, 注册名, 字体路径, 是否可压缩标点]
     for part, is_latin in _split_by_script(converted):
+        entry = latin_entry if is_latin else cjk_entry
         if is_latin:
-            # 楷体/仿宋的西文部分按衬线处理（与宋体一致）
-            if category in ('serif', 'kai', 'fangsong'):
-                key = 'latin_serif_bold' if is_bold else 'latin_serif'
-            else:
-                key = 'latin_sans_bold' if is_bold else 'latin_sans'
-        else:
-            # 粗体仅在有同族粗体文件时生效，避免为保字重损失字体风格
-            if is_bold and category in ('sans', 'serif'):
-                key = category + '_bold'
-            else:
-                key = category
-        entry = fonts.get(key) or fonts['sans']
-        runs.append([part, entry['name'], entry['path']])
+            segments.append([part, entry['name'], entry['path'], False])
+            continue
+        for sub in _COMPRESSIBLE_PUNCT_RE.split(part):
+            if not sub:
+                continue
+            punct = _COMPRESSIBLE_PUNCT_RE.fullmatch(sub) is not None
+            segments.append([sub, entry['name'], entry['path'], punct])
 
     # 宽度自适应：测量失败则不做缩放
-    widths = [_measure(r[0], r[2], size) for r in runs]
+    widths = [_measure(seg[0], seg[2], size) for seg in segments]
+    naturals = [None] * len(segments)
     if all(w is not None for w in widths):
+        naturals = list(widths)
         total = sum(widths)
         if total > span_w + 0.5 and total > 0:
-            scale = max(span_w / total, 0.5)
-            size *= scale
-            widths = [_measure(r[0], r[2], size) for r in runs]
+            punct_total = sum(w for w, seg in zip(widths, segments) if seg[3])
+            deficit = total - span_w
+            if punct_total > 0 and deficit <= punct_total * 0.55:
+                # 只压缩标点推进宽度（不低于半宽），字形保持原字号
+                ratio = max(1.0 - deficit / punct_total, 0.45)
+                widths = [w * ratio if seg[3] else w
+                          for w, seg in zip(widths, segments)]
+            else:
+                # 标点压到半宽仍放不下：先压标点，剩余缺口再缩字号
+                scale_denom = total - punct_total * 0.5
+                scale = max(span_w / scale_denom, 0.5) if scale_denom > 0 else 0.5
+                size *= scale
+                widths = [_measure(seg[0], seg[2], size) for seg in segments]
+                widths = [w * 0.5 if seg[3] else w
+                          for w, seg in zip(widths, segments)]
 
-    for (part, font_key, _path), width in zip(runs, widths):
-        page_builder.font(font_key, size).at(x, y).inline_color(
-            color[0], color[1], color[2], part)
+    for seg, width, natural in zip(segments, widths, naturals):
+        draw_x = x
+        if (seg[3] and width and natural and width < natural
+                and _OPEN_PUNCT_RE.fullmatch(seg[0])):
+            # 开标点：墨迹右缘对齐压缩后单元的右界（贴住后面的字）
+            draw_x = x + width - _OPEN_PUNCT_INK_RIGHT * size
+        page_builder.font(seg[1], size).at(draw_x, y).inline_color(
+            color[0], color[1], color[2], seg[0])
         if width:
             x += width
     return True
@@ -861,7 +962,8 @@ def convert_pdf_file(
                     if _draw_text(page_builder, cc, run['text'],
                                   run['x'] - cx0, run['y'] - cy0, run['w'],
                                   run['font_name'], run['size'], run['color'],
-                                  run['bold'], fonts):
+                                  run['bold'], fonts,
+                                  char_xs=[v - cx0 for v in run.get('xs', ())] or None):
                         converted_spans += 1
             else:
                 # 回退：按 span 重排
