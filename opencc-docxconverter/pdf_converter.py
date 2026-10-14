@@ -1,3 +1,5 @@
+import difflib
+import functools
 import io
 import os
 import re
@@ -371,7 +373,17 @@ def _find_font(exact_candidates: List[str], scan_key: str,
 # 文本宽度测量（PIL，用于精确推进绘制位置和自适应缩放）
 # ---------------------------------------------------------------------------
 
-_font_measure_cache = {}
+@functools.lru_cache(maxsize=128)
+def _measure_font(font_path: str, px: float) -> Optional[ImageFont.FreeTypeFont]:
+    """
+    加载用于测量的 PIL 字体对象，按 (路径, 字号) 进程内有限缓存——
+    长驻进程连续转换多份文件时不会无界累积字体对象。加载失败返回
+    None（同样被缓存，不会反复重试失败的路径）。
+    """
+    try:
+        return ImageFont.truetype(font_path, px or 1)
+    except Exception:
+        return None
 
 
 def _measure(text: str, font_path: str, size: float) -> Optional[float]:
@@ -381,21 +393,32 @@ def _measure(text: str, font_path: str, size: float) -> Optional[float]:
     """
     if not text:
         return 0.0
-    key = (font_path, round(size, 2))
-    font = _font_measure_cache.get(key)
+    font = _measure_font(font_path, round(size, 2))
     if font is None:
-        try:
-            font = ImageFont.truetype(font_path, round(size, 2) or 1)
-        except Exception:
-            _font_measure_cache[key] = False  # 标记该字体不可测量
-            return None
-        _font_measure_cache[key] = font
-    if font is False:
         return None
     try:
         return float(font.getlength(text))
     except Exception:
         return None
+
+
+def _estimate_width(text: str, size: float) -> float:
+    """无法用字体测量时的保守宽度估算：宽字符（CJK/全角等）按 1em、其余按 0.55em"""
+    wide = 0
+    for ch in text:
+        cp = ord(ch)
+        if (0x1100 <= cp <= 0x115F or 0x2E80 <= cp <= 0xA4CF or 0xAC00 <= cp <= 0xD7A3
+                or 0xF900 <= cp <= 0xFAFF or 0xFE30 <= cp <= 0xFE4F
+                or 0xFF00 <= cp <= 0xFF60 or 0xFFE0 <= cp <= 0xFFE6
+                or 0x20000 <= cp <= 0x3FFFD):
+            wide += 1
+    return (wide + (len(text) - wide) * 0.55) * size
+
+
+def _measure_or_estimate(text: str, font_path: str, size: float) -> float:
+    """测量优先，测量失败回退估算——保证任何段都有有限宽度可推进绘制位置"""
+    w = _measure(text, font_path, size)
+    return w if w is not None else _estimate_width(text, size)
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +477,60 @@ def _char_is_bold(ch) -> bool:
     return ('bold' in weight) or ('heavy' in weight) or ('black' in weight)
 
 
+def _upright_page_is_vertical(chars: list) -> bool:
+    """
+    依据直立字符的坐标分布判断版面方向：y 方向聚类数远多于 x 方向聚类数
+    （且行数足够）时为竖排版面。
+
+    竖排的中日文正文（方正书版/InDesign/Word 等）字形直立、沿列自上而下
+    排布，与“字形旋转 90° 的侧排文字”（_sideways 路径）是两种不同的实现；
+    前者的字符旋转角为 0，只能靠坐标分布识别。用聚类计数而非去重计数，
+    避免基线/列位的微小抖动把同一行/列拆成多个。字符太少的页面不做判定
+    （保持横排处理；单列少量字符按行读取时 y 降序恰好也是正确阅读序）。
+    仅凭聚类计数会把窄横向版面（每行一两个字的小表格、表头等）误判为
+    竖排：真竖排的列内相邻字符步进约 1em（字身框），而窄横向版面按 x
+    聚出的“列”内纵向步进是行距（通常 >= 1.5em），据此再过滤一道。
+    """
+    if len(chars) < 12:
+        return False
+    sizes = sorted((c.font_size or 10.0) for c in chars)
+    tol = max(sizes[len(sizes) // 2] * 0.35, 1.5)
+
+    def _cluster_count(values) -> int:
+        count, anchor = 0, None
+        for v in sorted(values):
+            if anchor is None or v - anchor > tol:
+                count += 1
+                anchor = v
+        return count
+
+    n_rows = _cluster_count(c.origin_y for c in chars)
+    n_cols = _cluster_count(c.origin_x for c in chars)
+    if not (n_rows >= 4 and n_rows > n_cols * 2):
+        return False
+
+    # 列内步进校验：与调用方一致按 x 贪心聚列，取列内相邻字符纵向步进
+    # （以字号归一）的中位数，须落在约 1em 附近才算真竖排。行距极紧
+    # （约 1.4em 以内）的窄表格仍可能通过，属可接受的残余误判。
+    cols: List[List] = []  # [锚点列 x, 字符列表]
+    for c in sorted(chars, key=lambda c: c.origin_x):
+        if cols and abs(c.origin_x - cols[-1][0]) <= tol:
+            cols[-1][1].append(c)
+        else:
+            cols.append([c.origin_x, [c]])
+    gaps: List[float] = []
+    for _ax, col in cols:
+        col.sort(key=lambda c: -c.origin_y)
+        for a, b in zip(col, col[1:]):
+            dy = a.origin_y - b.origin_y
+            if dy > 0:
+                gaps.append(dy / max(a.font_size or 10.0, b.font_size or 10.0))
+    if not gaps:
+        return False
+    gaps.sort()
+    return 0.75 <= gaps[len(gaps) // 2] <= 1.4
+
+
 def _char_runs_from_page(doc: PdfDocument, page_index: int,
                          log: Callable[[str], None]) -> Optional[List[dict]]:
     """
@@ -464,8 +541,25 @@ def _char_runs_from_page(doc: PdfDocument, page_index: int,
     精确坐标出发：同风格且间隙小于阈值的字符合并为一个单元，间隙大的各自
     按原坐标定位——既不引入多余空格，也保留原文版式（含两端对齐的拉伸）。
 
-    返回 None 表示字符提取失败（调用方回退到 span 模式），否则返回单元列表：
-    {text, x, y, w, font_name, size, color, bold}，坐标为 PDF 用户空间。
+    排序先做行/列聚类再在行内按 x（列内按 y）排序。不能直接用
+    round(y, 1) 分桶排序：0.1 的取整边界会把基线有微小抖动的同行字符拆进
+    相邻两个“桶”，与行内合并阈值（约 0.35em）不一致，造成行内乱序、单元
+    被无谓拆散。旋转字符（竖排文字、侧排标注）不再丢弃：沿其阅读方向聚合成
+    单元后按原位横排绘制（内容不丢失，字形方向与原文可能不同）。
+
+    版面方向检测为竖排时（直立字形沿列排布，见 _upright_page_is_vertical），
+    直立字符改按“列从右到左、列内自上而下”聚合：竖排按行横读会把各列
+    同一高度的字交织成乱序文本，一对多转换的词上下文（如“於是→于是”、
+    “彷彿→仿佛”）完全失效；按列读取后上下文与阅读序一致。竖排列获得
+    自右而左递增的列号（写入 line 字段，rot 保持 0、vert 置 True），
+    供跨单元连续性判断使用。
+
+    返回 None 表示字符提取失败或无可用字符（调用方回退到 span 模式），
+    否则返回单元列表：
+    {text, x, y, w, font_name, size, color, bold, rot, line, lx0, xs, ys,
+    vert}，坐标为 PDF 用户空间，xs/ys 为逐字坐标（与 text 等长），
+    line 为所在水平行的行号（竖排列为列号，旋转列为 None），lx0 为所在
+    行的行首 x，vert 表示是否为竖排列单元。
     """
     try:
         chars = doc.extract_chars(page_index)
@@ -473,84 +567,264 @@ def _char_runs_from_page(doc: PdfDocument, page_index: int,
         log(f"  ⚠ 第{page_index + 1}页字符提取失败: {e}，改用片段模式重排")
         return None
     if not chars:
-        return []
+        log(f"  ⚠ 第{page_index + 1}页字符提取结果为空，改用片段模式重排")
+        return None
 
-    # 自上而下、自左而右扫描
-    chars = sorted(chars, key=lambda c: (-round(c.origin_y, 1), c.origin_x))
+    def _line_tol(size: float) -> float:
+        return max(size * 0.35, 1.5)
+
+    def _char_size(ch) -> float:
+        return ch.font_size if ch.font_size and ch.font_size > 0 else 10.0
+
+    def _rot_deg(ch) -> float:
+        # 归一到 [0, 360)，±45° 以内视为水平（消除 359.9° 之类的噪声）
+        r = (getattr(ch, 'rotation_degrees', 0.0) or 0.0) % 360.0
+        return 0.0 if r >= 315.0 or r < 45.0 else r
+
+    def _sideways(rot: float) -> bool:
+        # 90°/270°：文本沿垂直方向排布（竖排、侧排），按列聚合
+        return 45.0 <= rot < 135.0 or 225.0 <= rot < 315.0
+
+    usable = [ch for ch in chars if ch.char]
+    upright = [ch for ch in usable if not _sideways(_rot_deg(ch))]
+    sideways = [ch for ch in usable if _sideways(_rot_deg(ch))]
+
+    # 水平字符按基线聚成行（自上而下，行内按 x）；侧排字符按列聚合（自左而右，列内按 y 自上而下）
+    horiz = sorted(upright, key=lambda c: (-c.origin_y, c.origin_x))
+    vert = sorted(sideways, key=lambda c: (c.origin_x, -c.origin_y))
+
+    h_lines: List[List] = []  # [锚点基线, 字符列表]
+    for ch in horiz:
+        if h_lines and abs(h_lines[-1][0] - ch.origin_y) <= _line_tol(_char_size(ch)):
+            h_lines[-1][1].append(ch)
+        else:
+            h_lines.append([ch.origin_y, [ch]])
+
+    v_lines: List[List] = []  # [锚点列 x, 字符列表]
+    for ch in vert:
+        if v_lines and abs(v_lines[-1][0] - ch.origin_x) <= _line_tol(_char_size(ch)):
+            v_lines[-1][1].append(ch)
+        else:
+            v_lines.append([ch.origin_x, [ch]])
+
+    # 行/列按（最靠上的字符 y, 最靠左的字符 x）排序，保持整体自上而下、自左而右；
+    # 水平行获得自上而下递增的行号（旋转列为 None），供跨行连续性判断使用。
+    # 竖排版面改为：直立字符按 x 聚成列、按“列从右到左”编号（列内自上而下），
+    # 列号写入 line 字段（rot 保持 0、vert 置 True），侧排列仍附在最后。
+    vertical_page = _upright_page_is_vertical(upright)
+    lines = []  # (字符列表, 是否旋转列, 竖排列号或 None)
+    if vertical_page:
+        cols: List[List] = []  # [锚点列 x, 字符列表]，x 升序贪心聚类
+        for ch in sorted(upright, key=lambda c: c.origin_x):
+            if cols and abs(ch.origin_x - cols[-1][0]) <= _line_tol(_char_size(ch)):
+                cols[-1][1].append(ch)
+            else:
+                cols.append([ch.origin_x, [ch]])
+        cols.sort(key=lambda col: -col[0])  # 阅读序：列从右到左
+        for idx, (_ax, col_chars) in enumerate(cols):
+            col_chars.sort(key=lambda c: -c.origin_y)
+            lines.append((col_chars, False, idx))
+    else:
+        for _anchor, chs in h_lines:
+            chs.sort(key=lambda c: c.origin_x)
+            lines.append((chs, False, None))
+    for _anchor, chs in v_lines:
+        chs.sort(key=lambda c: -c.origin_y)
+        lines.append((chs, True, None))
+    if not vertical_page:
+        lines.sort(key=lambda entry: (-max(c.origin_y for c in entry[0]),
+                                      min(c.origin_x for c in entry[0])))
 
     runs: List[dict] = []
-    rotated_skipped = 0
     cur = None
     tail = None  # 当前单元的最后一个字符
 
-    for ch in chars:
-        char = ch.char
-        if not char:
-            continue
-        if getattr(ch, 'rotation_degrees', 0.0):
-            rotated_skipped += 1
-            continue
+    line_no = 0
+    for chs, sideways_line, vcol in lines:
+        # 行号只编给水平行（连续且不被旋转列的插入打断）；竖排列写列号
+        # （自右而左递增），旋转列为 None
+        line_id = None
+        if vcol is not None:
+            line_id = vcol
+        elif not sideways_line:
+            line_id = line_no
+            line_no += 1
+        line_x0 = min(c.origin_x for c in chs)
+        for ch in chs:
+            char = ch.char
+            size = _char_size(ch)
+            bold = _char_is_bold(ch)
+            rot = _rot_deg(ch)
+            # 合并判定用归一化字体名（剥离子集前缀、忽略大小写）与量化颜色：
+            # 同一文字流的子集前缀不同（ABCDEF+SimSun / GHIJKL+SimSun）或
+            # 颜色仅差转换噪声时不应拆开，否则会削弱转换的词上下文。
+            # 旋转角也需量化——extract_chars 的 rotation_degrees 不吸附象限
+            # （逐字矩阵的角度可有微小抖动），不取整会拆散同一侧排列
+            base_name = ch.font_name or ''
+            if '+' in base_name:
+                base_name = base_name.split('+', 1)[1]
+            color = ch.color or (0.0, 0.0, 0.0)
+            color_key = tuple(round(min(max(c, 0.0), 1.0) * 255) for c in color)
+            style = (base_name.casefold(), round(size, 1), color_key, bold, round(rot, 1))
 
-        size = ch.font_size if ch.font_size and ch.font_size > 0 else 10.0
-        bold = _char_is_bold(ch)
-        style = (ch.font_name, round(size, 1), tuple(ch.color or (0.0, 0.0, 0.0)), bold)
-
-        merged = False
-        if cur is not None:
-            same_line = abs(ch.origin_y - tail.origin_y) <= max(size * 0.35, 1.5)
-            gap = ch.origin_x - (tail.origin_x + (tail.advance_width or 0.0))
-            # 西文相邻用较紧的阈值（真实空格约 0.25em），中西文及中文之间放宽，
-            # 尽量让词语留在同一单元以保证词汇级转换的上下文
-            latin_pair = (_LATIN_RUN_RE.fullmatch(tail.char or '') is not None
-                          and _LATIN_RUN_RE.fullmatch(char) is not None)
-            threshold = size * (0.20 if latin_pair else 0.30)
-            if same_line and gap <= threshold and cur['style'] == style:
+            merged = False
+            if cur is not None and cur['style'] == style:
+                if vcol is not None:
+                    # 竖排列内：同列（x 相近）且纵向步进约 1em 即合并
+                    same_col = abs(ch.origin_x - tail.origin_x) <= _line_tol(size)
+                    dy = tail.origin_y - ch.origin_y
+                    if same_col and 0.0 < dy <= size * 1.6:
+                        merged = True
+                elif _sideways(rot):
+                    # 侧排字符沿 y 方向阅读：同列（x 相近）且垂直间距正常即合并
+                    same_col = abs(ch.origin_x - tail.origin_x) <= _line_tol(size)
+                    dy = abs(ch.origin_y - tail.origin_y)
+                    if same_col and 0.0 < dy <= size * 1.6:
+                        merged = True
+                else:
+                    same_line = abs(ch.origin_y - tail.origin_y) <= _line_tol(size)
+                    gap = ch.origin_x - (tail.origin_x + (tail.advance_width or 0.0))
+                    # 西文相邻用较紧的阈值（真实空格约 0.25em），中西文及中文之间放宽，
+                    # 尽量让词语留在同一单元以保证词汇级转换的上下文
+                    latin_pair = (_LATIN_RUN_RE.fullmatch(tail.char or '') is not None
+                                  and _LATIN_RUN_RE.fullmatch(char) is not None)
+                    threshold = size * (0.20 if latin_pair else 0.30)
+                    if same_line and gap <= threshold:
+                        merged = True
+            if merged:
                 cur['text'] += char
                 cur['xs'].append(ch.origin_x)
-                cur['w'] = (ch.origin_x + (ch.advance_width or 0.0)) - cur['x']
+                cur['ys'].append(ch.origin_y)
+                cur['w'] = max(cur['w'],
+                               (ch.origin_x + (ch.advance_width or 0.0)) - cur['x'])
                 tail = ch
-                merged = True
+            else:
+                cur = {
+                    'text': char,
+                    'x': ch.origin_x,
+                    'y': ch.origin_y,
+                    'w': ch.advance_width or 0.0,
+                    'font_name': ch.font_name,
+                    'size': size,
+                    'color': ch.color,
+                    'bold': bold,
+                    'rot': rot,
+                    'style': style,
+                    'line': line_id,
+                    'lx0': line_x0,
+                    'xs': [ch.origin_x],
+                    'ys': [ch.origin_y],
+                    'vert': vcol is not None,
+                }
+                runs.append(cur)
+                tail = ch
 
-        if not merged:
-            cur = {
-                'text': char,
-                'x': ch.origin_x,
-                'y': ch.origin_y,
-                'w': ch.advance_width or 0.0,
-                'font_name': ch.font_name,
-                'size': size,
-                'color': ch.color,
-                'bold': bold,
-                'style': style,
-                'xs': [ch.origin_x],
-            }
-            runs.append(cur)
-            tail = ch
+    if not runs:
+        return None
 
-    if rotated_skipped:
-        log(f"  ⚠ 第{page_index + 1}页有 {rotated_skipped} 个旋转字符无法按水平文本重排，已跳过")
-
+    rotated_runs = 0
     for r in runs:
+        if r['rot']:
+            rotated_runs += 1
+            # 逆时针侧排（90°）与倒排（180°）文本的阅读方向与扫描序相反，
+            # 反转后 text 与 xs/ys 仍逐字配对，转换也能拿到正序上下文
+            if r['rot'] in (90.0, 180.0):
+                r['text'] = r['text'][::-1]
+                r['xs'].reverse()
+                r['ys'].reverse()
         r.pop('style', None)
+
+    if rotated_runs:
+        log(f"  ℹ 第{page_index + 1}页有 {rotated_runs} 段旋转文字，已按原位横排绘制"
+            f"（字形方向可能与原文不同）")
     return runs
 
 
 # ---------------------------------------------------------------------------
-# OpenCC 批量转换（按页直拼整体转换，按位置索引切回）
+# OpenCC 批量转换（按版面连续性拼接整体转换，按位置索引切回）
 # ---------------------------------------------------------------------------
 
 
-def _convert_page_texts(cc, texts: List[str],
-                        page_no: int, log: Callable[[str], None]) -> List[str]:
+def _runs_contiguity(runs: List[dict]) -> List[bool]:
     """
-    将一页的所有绘制单元文本直接拼成一段整体转换，再按位置索引切回各单元
-    （移植自 doc_converter 的段落级上下文方案）。
+    判断每个绘制单元与其前一个在版面上是否连续（供 _convert_page_texts
+    决定直接拼接还是插入换行分隔）：
+
+    - 竖排列单元（vert）之间：同列且与前一单元底部的纵向间距不超过约
+      1.6em：连续——列内风格切换拆开的单元之间可能正是一个词；跨列
+      （列边界、页眉列/正文列/脚注列）不连续，用换行分隔；
+    - 同一行且水平间距不超过约 1em（含轻微重叠）：连续——字体切换、两端
+      对齐拉伸拆开的单元之间可能正是一个词（“电”“复”分属宋体与 Times）；
+    - 相邻两行（行距 0.75em~2em，即正常行距）且两行行首 x 对齐（相差
+      不超过约 2.5em，同一段落的行首对齐或首行缩进）：连续——行尾行首
+      可能拆开一个词（“重”“复”）；分栏/居中标题等行首错开的则分隔；
+    - 其余（页眉/正文/脚注、分栏、表格单元间的大间距，以及旋转单元）：
+      不连续，转换时用换行分隔，避免边界处拼出原文不存在的“词”触发
+      错误短语转换。
+    """
+    flags: List[bool] = []
+    prev = None
+    for run in runs:
+        flag = False
+        if (prev is not None and run.get('vert') and prev.get('vert')
+                and run.get('line') is not None and run['line'] == prev.get('line')):
+            # 同一竖排列：与前一单元最后一个字的纵向间距正常即连续
+            size = max(run.get('size', 10.0), prev.get('size', 10.0))
+            prev_bottom = (prev.get('ys') or [prev['y']])[-1]
+            dy = prev_bottom - run['y']
+            flag = 0.0 < dy <= size * 1.6
+        elif (prev is not None and not run.get('vert') and not prev.get('vert')
+                and not run.get('rot') and not prev.get('rot')
+                and run.get('line') is not None and run['line'] == prev.get('line')):
+            size = max(run.get('size', 10.0), prev.get('size', 10.0))
+            gap = run['x'] - (prev['x'] + prev.get('w', 0.0))
+            flag = -0.3 * size <= gap <= size
+        elif (prev is not None and not run.get('vert') and not prev.get('vert')
+                and not run.get('rot') and not prev.get('rot')
+                and run.get('line') is not None and prev.get('line') is not None
+                and run['line'] == prev['line'] + 1):
+            size = max(run.get('size', 10.0), prev.get('size', 10.0))
+            dy = abs(run['y'] - prev['y'])
+            dx_first = abs(run.get('lx0', run['x']) - prev.get('lx0', prev['x']))
+            flag = 0.75 * size <= dy <= 2.0 * size and dx_first <= 2.5 * size
+        flags.append(flag)
+        prev = run
+    return flags
+
+
+def _spans_contiguity(spans: list) -> List[bool]:
+    """span 回退路径的相邻连续性判断（规则同 _runs_contiguity，基于 span.bbox）"""
+    flags: List[bool] = []
+    prev = None
+    for span in spans:
+        flag = False
+        if prev is not None:
+            x, y = span.bbox[0], span.bbox[1]
+            px, py, pw = prev.bbox[0], prev.bbox[1], prev.bbox[2]
+            size = max(span.font_size or 10.0, prev.font_size or 10.0)
+            if abs(y - py) <= max(size * 0.35, 1.5):
+                flag = -0.3 * size <= x - (px + pw) <= size
+            elif 0.75 * size <= abs(y - py) <= 2.0 * size:
+                flag = abs(x - px) <= 2.5 * size  # 近似行首对齐（span 无行结构）
+        flags.append(flag)
+        prev = span
+    return flags
+
+
+def _convert_page_texts(cc, texts: List[str],
+                        page_no: int, log: Callable[[str], None],
+                        contiguous: Optional[List[bool]] = None) -> List[str]:
+    """
+    将一页的绘制单元文本按版面连续性拼成若干段整体转换，再按位置索引切回
+    各单元（移植自 doc_converter 的段落级上下文方案）。
 
     PDF 字符级聚合出的单元常在词中间被切断（字体切换、换行、大间距，如
     分属行尾行首的“重复”、分属宋体与 Times 的“电复”），逐单元转换会让
-    歧义字失去词上下文（“复”→“復”而非“複”）。单元直拼后整页一次转换，
-    跨单元的词也能正确消歧；拆回不依赖分隔符——单元边界就是拼接时的字符
-    偏移，与转换内容无关：
+    歧义字失去词上下文（“复”→“復”而非“複”）。连续单元直接拼接后整段
+    一次转换，跨单元的词也能正确消歧；不连续的单元之间插入换行分隔
+    （OpenCC 不转换换行，也不跨它分词），避免页眉/脚注/分栏等无关区域
+    的边界拼出原文不存在的词。拆回不依赖分隔符内容——单元边界就是拼接
+    时的字符偏移：
 
     - 转换前后长度一致（繁简映射绝大多数 1:1）：按偏移切割，各单元原文
       与译文等长，可走逐字定位绘制路径，版式与原文一致；
@@ -560,12 +834,17 @@ def _convert_page_texts(cc, texts: List[str],
     """
     if not texts:
         return []
+    parts: List[str] = []
     positions = []
     offset = 0
-    for t in texts:
+    for i, t in enumerate(texts):
+        if i and not (contiguous and contiguous[i]):
+            parts.append('\n')
+            offset += 1
         positions.append((offset, offset + len(t)))
         offset += len(t)
-    full = ''.join(texts)
+        parts.append(t)
+    full = ''.join(parts)
     converted = cc.convert(full)
     if len(converted) == len(full):
         return [converted[s:e] for (s, e) in positions]
@@ -581,6 +860,9 @@ def _split_converted_by_prefix(cc, full: str, positions: List[Tuple[int, int]],
     由 OpenCC 自身的分词决定，词内的字不会被错配到相邻单元（draw 时
     错配意味着字符画到别的单元位置上）。
 
+    开销为 O(单元数 × 全文长)，但只有转换改变字符数的页面才会走到这里
+    （繁简映射绝大多数 1:1，常用配置整本书都不会触发），实际页面在
+    几十毫秒量级，无需进一步优化（分治/整页对齐方案实测都无收益）。
     前缀长度理论上可能非单调（边界切在词中间、词典长短映射），用钳制
     保证边界单调递增，最坏退化为按邻近边界对齐——不丢字、不重复。
     （与 doc_converter._convert_paragraph_fallback 同一方案。）
@@ -590,6 +872,76 @@ def _split_converted_by_prefix(cc, full: str, positions: List[Tuple[int, int]],
         q = len(cc.convert(full[:e]))
         bounds.append(min(max(q, bounds[-1]), len(converted)))
     return [converted[bounds[i]:bounds[i + 1]] for i in range(len(positions))]
+
+
+# ---------------------------------------------------------------------------
+# 修改字高亮（可选）：转换中被修改的汉字以黄色底纹标出
+# ---------------------------------------------------------------------------
+
+# 高亮底纹颜色（黄色）
+_HIGHLIGHT_RGB = (1.0, 1.0, 0.0)
+
+# 汉字（表意文字）码位区间，用于判断“修改的字”：标点、西文、数字等
+# 非汉字的变化不在其列；高亮只比较文字码位，与重建 PDF 时的输出字体
+# 替换（原文的宋体/黑体/方正白体等换成系统字体）无关
+_CJK_IDEOGRAPH_RANGES = (
+    (0x3007, 0x3007),    # 〇
+    (0x3400, 0x4DBF),    # 扩展A
+    (0x4E00, 0x9FFF),    # 基本区
+    (0xF900, 0xFAFF),    # 兼容表意文字
+    (0x20000, 0x2A6DF),  # 扩展B
+    (0x2A700, 0x2EBEF),  # 扩展C~F
+    (0x2F800, 0x2FA1F),  # 兼容表意文字增补
+    (0x30000, 0x323AF),  # 扩展G~H
+)
+
+
+def _is_cjk_ideograph(ch: str) -> bool:
+    """是否为汉字（表意文字，含扩展区、兼容区与〇）"""
+    cp = ord(ch)
+    if 0x3400 <= cp <= 0x9FFF:  # 扩展A + 基本区，绝大多数命中在此
+        return True
+    return any(lo <= cp <= hi for lo, hi in _CJK_IDEOGRAPH_RANGES)
+
+
+def _char_is_modified_hanzi(orig: str, conv: str) -> bool:
+    """
+    单个码位的替换是否属于应高亮的“修改的字”：码位发生变化，且原文
+    或译文至少一方是汉字。兼容区与基本区之间的同形换码（如 U+F900
+    豈 → U+8C48 豈）码位确实变了，按修改高亮；标点符号（含全半角
+    互换）与西文、数字的变化不高亮。
+    """
+    if orig == conv:
+        return False
+    return _is_cjk_ideograph(orig) or _is_cjk_ideograph(conv)
+
+
+def _highlight_mask(orig: str, conv: str) -> List[bool]:
+    """
+    逐字比较原文与译文，得到与译文等长的高亮掩码（True=该字被修改）。
+
+    长度一致（繁简映射绝大多数 1:1）时按位比较；长度变化（罕见的多字
+    映射，如 s2twp 的“内存”→“記憶體”）用最长公共子序列对齐，只在
+    替换/插入区块内高亮汉字——equal 区块是未变化的原文，无需比较。
+    """
+    n = len(conv)
+    if n == 0:
+        return []
+    if len(orig) == n:
+        return [_char_is_modified_hanzi(o, c) for o, c in zip(orig, conv)]
+    mask = [False] * n
+    matcher = difflib.SequenceMatcher(a=orig, b=conv, autojunk=False)
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+        for j in range(j1, j2):
+            mask[j] = _is_cjk_ideograph(conv[j])
+    return mask
+
+
+def _highlight_rect_metrics(size: float) -> Tuple[float, float]:
+    """高亮底纹相对基线的几何：下探 0.80em、总高 1.05em（约覆盖汉字字身框）"""
+    return -0.80 * size, 1.05 * size
 
 
 # ---------------------------------------------------------------------------
@@ -605,13 +957,15 @@ _COMPRESSIBLE_PUNCT_RE = re.compile(
 # 全角开标点（墨迹靠字身框右侧）：推进宽度被压缩后若仍按原位绘制，墨迹
 # 会压到后面的字，需左移使其墨迹右缘对齐单元右界——源文档“标点半角”
 # 正是开标点紧贴后字的效果。
-_OPEN_PUNCT_RE = re.compile(r'[（（《〈“‘【〔「『]')
+_OPEN_PUNCT_RE = re.compile(r'[（《〈“‘【〔「『]')
 _OPEN_PUNCT_INK_RIGHT = 0.9  # 开标点墨迹右缘约占字身框比例（宋体系实测 0.85~0.91）
 
 
 def _draw_text(page_builder, text: str, x: float, y: float, run_w: float,
                font_name: Optional[str], size: float, color, is_bold: bool,
-               fonts: dict, char_xs: Optional[List[float]] = None) -> bool:
+               fonts: dict, char_xs: Optional[List[float]] = None,
+               char_ys: Optional[List[float]] = None,
+               highlight_mask: Optional[List[bool]] = None) -> bool:
     """
     按脚本分组绘制一段已转换的文本到指定位置。
 
@@ -620,11 +974,14 @@ def _draw_text(page_builder, text: str, x: float, y: float, run_w: float,
     - 按原文风格类别（黑体/宋体/楷体/仿宋）匹配输出字体，保留字体区分度
     - 西文/数字按原文风格选择衬线/非衬线拉丁字体；中文语境下的半角标点
       跟随中文字体（源文档里它们由中文字库渲染，落到西文字体会明显变小）
-    - 优先逐字按原始坐标绘制（char_xs）：完整保留两端对齐的字距拉伸与
-      方正书版“标点半角”版式——整段按字体自然宽度推进会让段内文字逐渐
-      左漂，在段尾与后一单元之间留下空隙。char_xs 对应原文文本，长度与
-      转换后文本一致时可用；OpenCC 短语转换可能改变字符数（如 s2twp 的
-      “内存”→“記憶體”），此时回退到整段重排
+    - 优先逐字按原始坐标绘制（char_xs，可选 char_ys）：完整保留两端对齐
+      的字距拉伸与方正书版“标点半角”版式——整段按字体自然宽度推进会让
+      段内文字逐渐左漂，在段尾与后一单元之间留下空隙。char_xs/char_ys
+      对应原文文本，长度与转换后文本一致时可用；竖排等旋转单元靠
+      char_ys 逐字落到各自的基线上。OpenCC 短语转换可能改变字符数
+      （如 s2twp 的“内存”→“記憶體”），此时回退到整段重排
+    - highlight_mask 与 text 等长，为 True 的字先铺黄色底纹再绘制文字
+      （内容流按调用顺序叠放，先绘制的底纹位于文字下层）
     - 整段重排路径（span 回退、转换改变字符数）中，中文标点独立成段：
       输出中文字体的标点字身框是全宽的，而源文档标点推进宽度常只有一半，
       按自然宽度推进会触发缩字号、把标点明显变小。标点单独定位后只压缩
@@ -637,8 +994,10 @@ def _draw_text(page_builder, text: str, x: float, y: float, run_w: float,
     if not text:
         return False
 
-    span_w = run_w
     size = size if size and size > 0 else 10.0
+    # 单元宽度缺失（如旋转字符 advance 为 0）时按字数估算，避免重排路径
+    # 因 span_w 为 0 而把字号缩到下限
+    span_w = run_w if run_w and run_w > 0 else _estimate_width(text, size)
     color = color or (0.0, 0.0, 0.0)
 
     category = _classify_font_category(font_name)
@@ -656,16 +1015,48 @@ def _draw_text(page_builder, text: str, x: float, y: float, run_w: float,
     latin_entry = fonts.get(lkey) or fonts['sans']
 
     # --- 逐字定位路径：每个字落在原文坐标上 ---
-    # char_xs 与原文等长；转换后长度一致（OpenCC 多数映射为 1:1）时可用
+    # char_xs/char_ys 与原文等长；转换后长度一致（OpenCC 多数映射为 1:1）时可用
     if char_xs and len(char_xs) == len(text):
         n = len(char_xs)
+        has_ys = bool(char_ys) and len(char_ys) == n
+        # 书写轴判定：常规水平文本的 char_xs 单调递增；竖排文字与旋转页上的
+        # 文本沿竖直方向书写（char_xs 近似恒定、逐字位置由 char_ys 区分），
+        # 180° 旋转页则是镜像递减。这些布局下“到下一字的水平距离”与按
+        # span_w 推算的末字字格都不成立（会得到 0 或整行宽的错误值），
+        # 一律返回 0 走测量兜底——兜底宽度≈字宽，恰好覆盖方块字
+        stacked = has_ys and (max(char_xs) - min(char_xs)) < size * 0.5
+        mirrored = char_xs[-1] < char_xs[0] - size * 0.5
+
+        def _cell(i: int) -> float:
+            if stacked:
+                return 0.0
+            if i + 1 < n:
+                return char_xs[i + 1] - char_xs[i]
+            if mirrored:
+                return 0.0
+            return span_w - (char_xs[i] - char_xs[0])
+
+        # 修改字高亮：先铺黄色底纹，后绘制的文字位于其上层
+        if highlight_mask is not None:
+            dy, dh = _highlight_rect_metrics(size)
+            for i, marked in enumerate(highlight_mask[:n]):
+                if not marked:
+                    continue
+                cx = char_xs[i]
+                cy = char_ys[i] if has_ys else y
+                cell = _cell(i)
+                if cell <= 0:
+                    cell = _measure(text[i], cjk_entry['path'], size) or size
+                page_builder.filled_rect(cx, cy + dy, cell, dh,
+                                         _HIGHLIGHT_RGB[0], _HIGHLIGHT_RGB[1],
+                                         _HIGHLIGHT_RGB[2])
         for i, (ch, cx) in enumerate(zip(text, char_xs)):
             draw_x = cx
+            cy = char_ys[i] if has_ys else y
             if _OPEN_PUNCT_RE.fullmatch(ch):
                 # 开标点墨迹靠字身框右侧：源单元（到下一字的距离）比全宽
                 # 窄时，左移使墨迹右缘对齐单元右界，贴住后面的字
-                cell = (char_xs[i + 1] - cx if i + 1 < n
-                        else span_w - (cx - char_xs[0]))
+                cell = _cell(i)
                 natural = _measure(ch, cjk_entry['path'], size)
                 if cell > 0 and natural and cell < natural:
                     draw_x = cx + cell - _OPEN_PUNCT_INK_RIGHT * size
@@ -673,13 +1064,13 @@ def _draw_text(page_builder, text: str, x: float, y: float, run_w: float,
                 entry = latin_entry
             else:
                 entry = cjk_entry
-            page_builder.font(entry['name'], size).at(draw_x, y).inline_color(
+            page_builder.font(entry['name'], size).at(draw_x, cy).inline_color(
                 color[0], color[1], color[2], ch)
         return True
 
     # --- 整段重排路径 ---
     segments = []  # [text, 注册名, 字体路径, 是否可压缩标点]
-    for part, is_latin in _split_by_script(converted):
+    for part, is_latin in _split_by_script(text):
         entry = latin_entry if is_latin else cjk_entry
         if is_latin:
             segments.append([part, entry['name'], entry['path'], False])
@@ -690,28 +1081,51 @@ def _draw_text(page_builder, text: str, x: float, y: float, run_w: float,
             punct = _COMPRESSIBLE_PUNCT_RE.fullmatch(sub) is not None
             segments.append([sub, entry['name'], entry['path'], punct])
 
-    # 宽度自适应：测量失败则不做缩放
-    widths = [_measure(seg[0], seg[2], size) for seg in segments]
-    naturals = [None] * len(segments)
-    if all(w is not None for w in widths):
-        naturals = list(widths)
-        total = sum(widths)
-        if total > span_w + 0.5 and total > 0:
-            punct_total = sum(w for w, seg in zip(widths, segments) if seg[3])
-            deficit = total - span_w
-            if punct_total > 0 and deficit <= punct_total * 0.55:
-                # 只压缩标点推进宽度（不低于半宽），字形保持原字号
-                ratio = max(1.0 - deficit / punct_total, 0.45)
-                widths = [w * ratio if seg[3] else w
-                          for w, seg in zip(widths, segments)]
-            else:
-                # 标点压到半宽仍放不下：先压标点，剩余缺口再缩字号
-                scale_denom = total - punct_total * 0.5
-                scale = max(span_w / scale_denom, 0.5) if scale_denom > 0 else 0.5
-                size *= scale
-                widths = [_measure(seg[0], seg[2], size) for seg in segments]
-                widths = [w * 0.5 if seg[3] else w
-                          for w, seg in zip(widths, segments)]
+    # 宽度自适应：真实测量值用于开标点定位（naturals），测量失败的段用
+    # 估算宽度推进绘制位置——否则 x 不前进，后续段会画到同一位置重叠
+    measured = [_measure(seg[0], seg[2], size) for seg in segments]
+    naturals = list(measured)
+    widths = [w if w is not None else _estimate_width(seg[0], size)
+              for w, seg in zip(measured, segments)]
+    total = sum(widths)
+    if total > span_w + 0.5 and total > 0:
+        punct_total = sum(w for w, seg in zip(widths, segments) if seg[3])
+        deficit = total - span_w
+        if punct_total > 0 and deficit <= punct_total * 0.55:
+            # 只压缩标点推进宽度（不低于半宽），字形保持原字号
+            ratio = max(1.0 - deficit / punct_total, 0.45)
+            widths = [w * ratio if seg[3] else w
+                      for w, seg in zip(widths, segments)]
+        else:
+            # 标点压到半宽仍放不下：先压标点，剩余缺口再缩字号
+            scale_denom = total - punct_total * 0.5
+            scale = max(span_w / scale_denom, 0.5) if scale_denom > 0 else 0.5
+            size *= scale
+            widths = [_measure_or_estimate(seg[0], seg[2], size) for seg in segments]
+            widths = [w * 0.5 if seg[3] else w
+                      for w, seg in zip(widths, segments)]
+
+    # 修改字高亮：整段重排路径中按段内自然字宽定位各字铺底纹
+    # （段宽已压缩/缩放时按比例归一，保证底纹与实际绘制位置一致）
+    if highlight_mask is not None:
+        dy, dh = _highlight_rect_metrics(size)
+        hx = x
+        base = 0  # 当前段首字在掩码中的索引
+        for seg, width in zip(segments, widths):
+            char_ws = [_measure(ch, seg[2], size) for ch in seg[0]]
+            total = sum(w for w in char_ws if w)
+            scale = (width / total) if (width and total > 0) else 1.0
+            cx = hx
+            for k, w in enumerate(char_ws):
+                w = (w if w is not None else size) * scale
+                if base + k < len(highlight_mask) and highlight_mask[base + k] and w > 0:
+                    page_builder.filled_rect(cx, y + dy, w, dh,
+                                             _HIGHLIGHT_RGB[0], _HIGHLIGHT_RGB[1],
+                                             _HIGHLIGHT_RGB[2])
+                cx += w
+            base += len(seg[0])
+            if width:
+                hx += width
 
     for seg, width, natural in zip(segments, widths, naturals):
         draw_x = x
@@ -727,26 +1141,49 @@ def _draw_text(page_builder, text: str, x: float, y: float, run_w: float,
 
 
 def _draw_span_text(page_builder, text: str, span, fonts: dict,
-                    ox: float, oy: float) -> bool:
+                    transform: Callable[[float, float], Tuple[float, float]],
+                    rotation: int = 0,
+                    highlight_mask: Optional[List[bool]] = None) -> bool:
     """按 span 绘制已转换的文本（字符级聚合失败时的回退路径）"""
     if not text or not text.strip():
         return False
     size = span.font_size if span.font_size and span.font_size > 0 else 10.0
-    return _draw_text(page_builder, text,
-                      span.bbox[0] - ox, span.bbox[1] - oy, span.bbox[2],
-                      span.font_name, size, span.color, span.is_bold, fonts)
+    x, y = transform(span.bbox[0], span.bbox[1])
+    # 旋转 90/270 后原用户空间的宽在输出中变为“高”，整段重排的宽度
+    # 自适应应以另一维（bbox[3]）为准
+    run_w = span.bbox[3] if rotation in (90, 270) else span.bbox[2]
+    return _draw_text(page_builder, text, x, y, run_w,
+                      span.font_name, size, span.color, span.is_bold, fonts,
+                      highlight_mask=highlight_mask)
 
 
 # ---------------------------------------------------------------------------
 # 页面元素重建辅助
 # ---------------------------------------------------------------------------
 
-def _offset_point(x: float, y: float, ox: float, oy: float) -> Tuple[float, float]:
-    """将用户空间坐标平移到以裁剪框左下角为原点的页面坐标系"""
-    return x - ox, y - oy
+def _page_space_transform(rotation: int, ox: float, oy: float,
+                          width: float, height: float
+                          ) -> Tuple[float, float, Callable[[float, float], Tuple[float, float]]]:
+    """
+    构造用户空间 -> 输出页面空间的坐标变换（裁剪框平移 + 页面旋转）。
+
+    pdf_oxide 的提取接口（extract_chars/extract_spans/extract_images 等）
+    返回的是未旋转的用户空间坐标，而 render_pixmap 按旋转后的视觉方向
+    渲染；输出端 FluentPageBuilder 不支持页面 /Rotate，因此旋转页需对
+    所有绘制坐标自行做旋转变换（页面宽高随之对调）。返回
+    (输出页宽, 输出页高, 点变换)；rotation 为 90 的倍数，非法值按 0 处理。
+    """
+    if rotation == 90:
+        return height, width, lambda x, y: (y - oy, width - (x - ox))
+    if rotation == 180:
+        return width, height, lambda x, y: (width - (x - ox), height - (y - oy))
+    if rotation == 270:
+        return height, width, lambda x, y: (height - (y - oy), x - ox)
+    return width, height, lambda x, y: (x - ox, y - oy)
 
 
-def _draw_lines(page_builder, lines: list, ox: float, oy: float) -> None:
+def _draw_lines(page_builder, lines: list,
+                transform: Callable[[float, float], Tuple[float, float]]) -> None:
     """按矢量线条的操作序列重画线段（表格边框、下划线等）"""
     for line in lines:
         color = line.get('stroke_color') or (0.0, 0.0, 0.0)
@@ -758,47 +1195,114 @@ def _draw_lines(page_builder, lines: list, ox: float, oy: float) -> None:
                 cur = (op.get('x', 0.0), op.get('y', 0.0))
             elif name == 'line_to' and cur is not None:
                 end = (op.get('x', 0.0), op.get('y', 0.0))
-                x1, y1 = _offset_point(cur[0], cur[1], ox, oy)
-                x2, y2 = _offset_point(end[0], end[1], ox, oy)
+                x1, y1 = transform(cur[0], cur[1])
+                x2, y2 = transform(end[0], end[1])
                 page_builder.stroke_line(x1, y1, x2, y2, width, color)
                 cur = end
 
 
-def _draw_rects(page_builder, rects: list, ox: float, oy: float) -> None:
+def _draw_rects(page_builder, rects: list,
+                transform: Callable[[float, float], Tuple[float, float]]) -> None:
     """重画矩形（底色块、边框等）；有填充色优先按填充绘制"""
     for rect in rects:
         x, y, w, h = rect.get('bbox', (0.0, 0.0, 0.0, 0.0))
-        x, y = _offset_point(x, y, ox, oy)
         fill = rect.get('fill_color')
+        # 变换对角点后取包围盒：旋转 90/270 时宽高自然互换
+        x0, y0 = transform(x, y)
+        x1, y1 = transform(x + w, y + h)
+        rx, ry = min(x0, x1), min(y0, y1)
+        rw, rh = abs(x1 - x0), abs(y1 - y0)
         if fill is not None:
-            page_builder.filled_rect(x, y, w, h, fill[0], fill[1], fill[2])
+            page_builder.filled_rect(rx, ry, rw, rh, fill[0], fill[1], fill[2])
         else:
             stroke = rect.get('stroke_color') or (0.0, 0.0, 0.0)
             width = rect.get('stroke_width') or 1.0
-            page_builder.stroke_rect(x, y, w, h, width, stroke)
+            page_builder.stroke_rect(rx, ry, rw, rh, width, stroke)
+
+
+def _match_images_to_blobs(metas: list, blobs: list, page_index: int,
+                           log: Callable[[str], None]) -> list:
+    """
+    将图片位置元数据与图像数据配对。两者没有共同的对象标识，正常情况下
+    依赖提取顺序一致；数量不一致时退化为按（像素宽, 像素高）逐个配对，
+    配不上的跳过——宁可少画，也不把图像画到别的位置上去。
+    """
+    if len(metas) == len(blobs):
+        return list(zip(metas, blobs))
+    if metas or blobs:
+        log(f"  ⚠ 第{page_index + 1}页图片位置与图像数据数量不一致"
+            f"（{len(metas)}/{len(blobs)}），尝试按尺寸配对")
+
+    def _dims(item):
+        if isinstance(item, dict):
+            return (item.get('width'), item.get('height'))
+        return None
+
+    pairs = []
+    used = [False] * len(blobs)
+    for meta in metas:
+        key = _dims(meta)
+        hit = None
+        if key:
+            for j, blob in enumerate(blobs):
+                if not used[j] and _dims(blob) == key:
+                    hit = j
+                    break
+        if hit is None:
+            if isinstance(meta, dict) and meta.get('bbox'):
+                log(f"  ⚠ 第{page_index + 1}页一张图片未能配对到图像数据，已跳过")
+            continue
+        used[hit] = True
+        pairs.append((meta, blobs[hit]))
+    return pairs
+
+
+def _rotate_image_bytes(data: bytes, rotation: int) -> bytes:
+    """
+    按页面旋转方向旋转图像内容（输出页无法表达 /Rotate，图像内容需与
+    坐标一起旋转才能与原文视觉一致）。旋转失败时原样返回。
+    JPEG 重编码用高质量参数（PIL 默认 quality=75 会让旋转页的图片明显
+    画质劣化）；PNG 本身无损，保持默认。
+    """
+    try:
+        im = Image.open(io.BytesIO(data))
+        angle = {90: -90, 180: 180, 270: 90}[rotation]
+        buf = io.BytesIO()
+        rotated = im.rotate(angle, expand=True)
+        if (im.format or "").upper() == "JPEG":
+            rotated.save(buf, format="JPEG", quality=95, subsampling=0)
+        else:
+            rotated.save(buf, format=im.format or "PNG")
+        return buf.getvalue()
+    except Exception:
+        return data
 
 
 def _draw_images(page_builder, doc: PdfDocument, page_index: int,
-                 ox: float, oy: float, log: Callable[[str], None]) -> int:
+                 transform: Callable[[float, float], Tuple[float, float]],
+                 rotation: int, log: Callable[[str], None]) -> int:
     """
     将页面上的图片按原位置嵌入新文档。
-    extract_images 提供位置（bbox），extract_image_bytes 提供图像字节，
-    两者按内容流顺序一一对应。
+    extract_images 提供位置（bbox 为 x,y,w,h），extract_image_bytes 提供图像
+    字节，两者按内容流顺序一一对应；数量不一致时按像素尺寸配对兜底。
     """
     metas = doc.extract_images(page_index) or []
     blobs = doc.extract_image_bytes(page_index) or []
-    if len(metas) != len(blobs):
-        log(f"  ⚠ 第{page_index + 1}页图片位置与图像数据数量不一致"
-            f"（{len(metas)}/{len(blobs)}），仅按序号对齐绘制")
 
     drawn = 0
-    for meta, blob in zip(metas, blobs):
+    for meta, blob in _match_images_to_blobs(metas, blobs, page_index, log):
         bbox = meta.get('bbox')
         data = blob.get('data') if isinstance(blob, dict) else blob
         if not bbox or not data:
             continue
-        x, y = _offset_point(bbox[0], bbox[1], ox, oy)
-        page_builder.image_with_alt(data, x, y, bbox[2], bbox[3], "")
+        x, y, w, h = bbox
+        # 变换对角点后取包围盒：旋转 90/270 时宽高自然互换
+        x0, y0 = transform(x, y)
+        x1, y1 = transform(x + w, y + h)
+        if rotation in (90, 180, 270):
+            data = _rotate_image_bytes(data, rotation)
+        page_builder.image_with_alt(data, min(x0, x1), min(y0, y1),
+                                    abs(x1 - x0), abs(y1 - y0), "")
         drawn += 1
     return drawn
 
@@ -810,7 +1314,10 @@ def _rasterize_page_png(doc: PdfDocument, page_index: int, dpi: int = 150) -> Op
     """
     try:
         pm = doc.render_pixmap(page_index, dpi=dpi)
-        im = Image.frombytes("RGBA", (pm.width, pm.height), pm.data)
+        # render_pixmap 返回预乘 RGBA8888（PDF 透明度模型）：需按 PIL 的
+        # "RGBa" 模式读入再转直通 alpha，直接当 "RGBA" 用会让半透明内容
+        # 的颜色偏暗
+        im = Image.frombytes("RGBa", (pm.width, pm.height), pm.data).convert("RGBA")
         bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
         bg.alpha_composite(im)
         buf = io.BytesIO()
@@ -829,7 +1336,8 @@ def convert_pdf_file(
     output_folder: str,
     conversion_type: str,
     log_callback: Optional[Callable[[str], None]] = None,
-    is_cancelled_callback: Optional[Callable[[], bool]] = None
+    is_cancelled_callback: Optional[Callable[[], bool]] = None,
+    highlight_changes: bool = False
 ) -> Union[str, bool]:
     """
     转换 PDF 文件中的文本内容并输出新的 PDF 文件。
@@ -852,6 +1360,10 @@ def convert_pdf_file(
         日志回调函数，接收字符串参数
     is_cancelled_callback : callable or None
         取消检查回调，返回 True 表示用户请求取消
+    highlight_changes : bool
+        是否为转换中修改的字添加黄色高亮。只高亮汉字的实质变化；
+        标点符号变化，以及重建时整体替换输出字体（宋体/黑体等）带来的
+        观感差异不属于“修改”，不高亮
 
     返回
     -------
@@ -889,6 +1401,9 @@ def convert_pdf_file(
     except Exception as e:
         log(f"错误：OpenCC 初始化失败 ({conversion_type}) - {e}")
         return False
+
+    if highlight_changes:
+        log("修改字高亮已启用：被转换修改的汉字将以黄色底纹标出（标点符号变化与输出字体替换不标）")
 
     # --- 查找输出用字体（固定候选路径 -> 目录扫描，按风格类别，带回退链） ---
     sans = _find_font(_CJK_SANS_CANDIDATES, 'sans', log)
@@ -962,9 +1477,11 @@ def convert_pdf_file(
         # --- 初始化输出文档 ---
         builder = DocumentBuilder().title(f"convert_{os.path.splitext(os.path.basename(input_path))[0]}")
 
-        # 实例化逻辑字体表；同一字体文件只注册一次，多个逻辑名共享注册名
+        # 实例化逻辑字体表；同一字体文件只注册一次，多个逻辑名共享注册名。
+        # 注册失败的路径也记入 registered_by_path（值为 None），共用该路径的
+        # 其他逻辑名不会反复重试、重复告警；基础黑体注册失败则无法兜底，致命
         fonts = {}
-        registered_by_path = {}
+        registered_by_path = {}  # 字体文件路径 -> 注册名（注册失败为 None）
         for key, default_name in _DEFAULT_FONT_NAMES.items():
             path = font_paths[key]
             if path not in registered_by_path:
@@ -972,13 +1489,19 @@ def convert_pdf_file(
                     builder = builder.register_embedded_font(default_name, EmbeddedFont.from_file(path))
                     registered_by_path[path] = default_name
                 except Exception as e:
-                    log(f"警告：字体 {os.path.basename(path)} 注册失败（{e}），相关文字将使用黑体渲染")
-                    fonts[key] = {'name': _DEFAULT_FONT_NAMES['sans'], 'path': font_paths['sans']}
-                    continue
-            fonts[key] = {'name': registered_by_path[path], 'path': path}
+                    registered_by_path[path] = None
+                    log(f"警告：字体 {os.path.basename(path)} 注册失败（{e}），相关文字将回退到黑体渲染")
+            if registered_by_path[path] is not None:
+                fonts[key] = {'name': registered_by_path[path], 'path': path}
+            elif key == 'sans':
+                log("错误：基础中文字体（黑体）注册失败，无法生成 PDF")
+                return False
+            else:
+                fonts[key] = dict(fonts['sans'])
 
         converted_spans = 0
-        warned_rotation = False
+        highlighted_chars = 0
+        vertical_pages = 0
 
         for page_index in range(total_pages):
             if is_cancelled_callback and is_cancelled_callback():
@@ -989,27 +1512,44 @@ def convert_pdf_file(
 
             # 裁剪框决定可见区域，输出页面以它为基准
             try:
-                cx0, cy0, cx1, cy1 = doc.page_crop_box(page_index)
+                box = doc.page_crop_box(page_index)
             except Exception:
-                cx0, cy0, cx1, cy1 = doc.page_media_box(page_index)
+                box = None
+            if not box:
+                try:
+                    box = doc.page_media_box(page_index)
+                except Exception:
+                    box = (0.0, 0.0, 612.0, 792.0)
+            cx0, cy0, cx1, cy1 = box
             page_w, page_h = cx1 - cx0, cy1 - cy0
             if page_w <= 0 or page_h <= 0:
-                mb = doc.page_media_box(page_index)
+                try:
+                    mb = doc.page_media_box(page_index)
+                except Exception:
+                    mb = (0.0, 0.0, 612.0, 792.0)
                 cx0, cy0 = mb[0], mb[1]
                 page_w, page_h = mb[2] - mb[0], mb[3] - mb[1]
 
-            rotation = doc.page_rotation(page_index)
-            if rotation and not warned_rotation:
-                log(f"  ⚠ 第{page_index + 1}页设置了页面旋转（{rotation}°），该页输出方向可能与原文不同")
-                warned_rotation = True
+            # 页面旋转：提取坐标未旋转、栅格化已旋转，输出端无 /Rotate，
+            # 用坐标变换把旋转应用到文本/矢量/图片上（扫描页栅格图本身就是
+            # 旋转后的视觉，直接铺满即可）
+            try:
+                rotation = int(doc.page_rotation(page_index) or 0) % 360
+            except Exception:
+                rotation = 0
+            if rotation % 90:
+                log(f"  ⚠ 第{page_index + 1}页旋转角度非 90 的倍数（{rotation}°），按未旋转处理")
+                rotation = 0
+            out_w, out_h, transform = _page_space_transform(
+                rotation, cx0, cy0, page_w, page_h)
 
-            page_builder = builder.page(page_w, page_h)
+            page_builder = builder.page(out_w, out_h)
 
             # --- 无文本层的扫描页：整页栅格化保留 ---
             if not doc.has_text_layer(page_index):
                 png = _rasterize_page_png(doc, page_index)
                 if png:
-                    page_builder.image_with_alt(png, 0.0, 0.0, page_w, page_h, "")
+                    page_builder.image_with_alt(png, 0.0, 0.0, out_w, out_h, "")
                 else:
                     log(f"  ⚠ 第{page_index + 1}页栅格化失败，输出为空白页")
                 builder = page_builder.done()
@@ -1017,30 +1557,49 @@ def convert_pdf_file(
 
             # --- 图片（先画，位于文字下层） ---
             try:
-                _draw_images(page_builder, doc, page_index, cx0, cy0, log)
+                _draw_images(page_builder, doc, page_index, transform, rotation, log)
             except Exception as e:
                 log(f"  ⚠ 第{page_index + 1}页图片保留失败: {e}")
 
             # --- 矢量线条与矩形 ---
             try:
-                _draw_lines(page_builder, doc.extract_lines(page_index) or [], cx0, cy0)
-                _draw_rects(page_builder, doc.extract_rects(page_index) or [], cx0, cy0)
+                _draw_lines(page_builder, doc.extract_lines(page_index) or [], transform)
+                _draw_rects(page_builder, doc.extract_rects(page_index) or [], transform)
             except Exception as e:
                 log(f"  ⚠ 第{page_index + 1}页矢量图形保留失败: {e}")
 
-            # --- 文本：字符级聚合成绘制单元，按页直拼转换后按位置切回重排
-            #     （直拼转换保留跨单元的词上下文；字符聚合避免推断空格拆开单词） ---
+            # --- 文本：字符级聚合成绘制单元，按版面连续性拼接转换后按位置切回重排
+            #     （连续拼接保留跨单元的词上下文；字符聚合避免推断空格拆开单词） ---
             char_runs = _char_runs_from_page(doc, page_index, log)
             if char_runs is not None:
+                if any(r.get('vert') for r in char_runs):
+                    vertical_pages += 1
+                contiguous = _runs_contiguity(char_runs)
                 converted_texts = _convert_page_texts(
-                    cc, [run['text'] for run in char_runs], page_index + 1, log)
+                    cc, [run['text'] for run in char_runs], page_index + 1, log,
+                    contiguous)
                 for run, converted in zip(char_runs, converted_texts):
-                    if _draw_text(page_builder, converted,
-                                  run['x'] - cx0, run['y'] - cy0, run['w'],
-                                  run['font_name'], run['size'], run['color'],
-                                  run['bold'], fonts,
-                                  char_xs=[v - cx0 for v in run.get('xs', ())] or None):
+                    mask = (_highlight_mask(run['text'], converted)
+                            if highlight_changes else None)
+                    tpoints = [transform(a, b) for a, b in
+                               zip(run.get('xs', ()), run.get('ys', ()))]
+                    try:
+                        drawn = _draw_text(page_builder, converted,
+                                           *transform(run['x'], run['y']), run['w'],
+                                           run['font_name'], run['size'], run['color'],
+                                           run['bold'], fonts,
+                                           char_xs=[p[0] for p in tpoints] or None,
+                                           char_ys=[p[1] for p in tpoints] or None,
+                                           highlight_mask=mask)
+                    except Exception as e:
+                        # 单个单元绘制失败不应中断整份文件（如个别字符触发了
+                        # 字体/测量的边界错误），跳过该单元继续
+                        log(f"  ⚠ 第{page_index + 1}页一个文本单元绘制失败: {e}")
+                        continue
+                    if drawn:
                         converted_spans += 1
+                        if mask:
+                            highlighted_chars += sum(mask)
             else:
                 # 回退：按 span 重排
                 try:
@@ -1049,11 +1608,23 @@ def convert_pdf_file(
                     log(f"  ⚠ 第{page_index + 1}页文本提取失败: {e}")
                     spans = []
 
+                contiguous = _spans_contiguity(spans)
                 converted_texts = _convert_page_texts(
-                    cc, [span.text or '' for span in spans], page_index + 1, log)
+                    cc, [span.text or '' for span in spans], page_index + 1, log,
+                    contiguous)
                 for span, converted in zip(spans, converted_texts):
-                    if _draw_span_text(page_builder, converted, span, fonts, cx0, cy0):
+                    mask = (_highlight_mask(span.text or '', converted)
+                            if highlight_changes else None)
+                    try:
+                        drawn = _draw_span_text(page_builder, converted, span, fonts,
+                                                transform, rotation, mask)
+                    except Exception as e:
+                        log(f"  ⚠ 第{page_index + 1}页一个文本片段绘制失败: {e}")
+                        continue
+                    if drawn:
                         converted_spans += 1
+                        if mask:
+                            highlighted_chars += sum(mask)
 
             builder = page_builder.done()
 
@@ -1074,7 +1645,12 @@ def convert_pdf_file(
             return False
 
         log(f"已保存: {output_path}")
-        log(f"PDF 转换完成：共 {total_pages} 页，转换 {converted_spans} 个文本片段")
+        summary = f"PDF 转换完成：共 {total_pages} 页，转换 {converted_spans} 个文本片段"
+        if vertical_pages:
+            summary += f"（其中 {vertical_pages} 页为竖排版面，已按“列从右到左、列内自上而下”顺序转换）"
+        if highlight_changes:
+            summary += f"，高亮 {highlighted_chars} 个修改字"
+        log(summary)
         return output_path
     finally:
         try:

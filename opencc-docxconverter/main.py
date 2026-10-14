@@ -110,7 +110,7 @@ class ConversionWorker(QThread):
 
     def __init__(self, input_path, output_folder, conversion_type='s2t', preserve_format=True,
                  convert_footnotes=True, force_encoding=None, segment_mode=None, input_paths=None,
-                 custom_config_path=None):
+                 custom_config_path=None, highlight_pdf=False):
         super().__init__()
         self.input_path = input_path
         self.output_folder = output_folder
@@ -121,6 +121,7 @@ class ConversionWorker(QThread):
         self.segment_mode = segment_mode
         self.input_paths = input_paths
         self.custom_config_path = custom_config_path
+        self.highlight_pdf = highlight_pdf
         self._is_cancelled = False
 
     def run(self):
@@ -277,7 +278,8 @@ class ConversionWorker(QThread):
                         if convert_pdf_file(
                             file_path, self.output_folder, self.conversion_type,
                             lambda msg: self.log_message.emit(msg),
-                            lambda: self._is_cancelled
+                            lambda: self._is_cancelled,
+                            self.highlight_pdf
                         ):
                             success_count += 1
                     except Exception as e:
@@ -386,7 +388,8 @@ class ConversionWorker(QThread):
                     result = convert_pdf_file(
                         self.input_path, self.output_folder, self.conversion_type,
                         lambda msg: self.log_message.emit(msg),
-                        lambda: self._is_cancelled
+                        lambda: self._is_cancelled,
+                        self.highlight_pdf
                     )
                 except Exception as e:
                     self.log_message.emit(f"处理 {os.path.basename(self.input_path)} 时出错: {str(e)}")
@@ -506,7 +509,8 @@ class ConversionWorker(QThread):
                         if convert_pdf_file(
                             file_path, self.output_folder, self.conversion_type,
                             lambda msg: self.log_message.emit(msg),
-                            lambda: self._is_cancelled
+                            lambda: self._is_cancelled,
+                            self.highlight_pdf
                         ):
                             success_count += 1
                     except Exception as e:
@@ -1057,6 +1061,30 @@ class ModernUI(QMainWindow):
 
         layout.addWidget(custom_group)
 
+        # PDF校对模式设置区域
+        pdf_group = QGroupBox("PDF校对模式")
+        pdf_group_layout = QVBoxLayout(pdf_group)
+        pdf_group_layout.setSpacing(15)
+        pdf_group_layout.setContentsMargins(15, 20, 15, 15)
+
+        # 校对模式说明
+        pdf_desc = QLabel(
+            "勾选后，PDF转换输出的文档中被转换修改的汉字将以黄色底纹标出，便于校对。"
+        )
+        pdf_desc.setWordWrap(True)
+        pdf_group_layout.addWidget(pdf_desc)
+
+        self.highlight_pdf_cb = QCheckBox("PDF转换后为被修改的字添加黄色高亮")
+        self.highlight_pdf_cb.setToolTip("仅对PDF文件生效：转换中被修改的汉字以黄色底纹标出")
+        self.highlight_pdf_cb.stateChanged.connect(self.on_pdf_highlight_changed)
+        pdf_group_layout.addWidget(self.highlight_pdf_cb)
+
+        # 从设置中恢复PDF校对模式
+        saved_pdf_highlight = self.settings.value("pdf_highlight", False, type=bool)
+        self.highlight_pdf_cb.setChecked(saved_pdf_highlight)
+
+        layout.addWidget(pdf_group)
+
         layout.addStretch()
         return tab
 
@@ -1157,6 +1185,13 @@ class ModernUI(QMainWindow):
             return
         self.statusBar().showMessage(f"自定义转换表已导出至: {path}")
 
+    def on_pdf_highlight_changed(self, state):
+        """PDF校对模式（修改字黄色高亮）更改事件处理"""
+        checked = self.highlight_pdf_cb.isChecked()
+        self.settings.setValue("pdf_highlight", checked)
+        self.statusBar().showMessage(
+            f"PDF校对模式（修改字黄色高亮）已{'开启' if checked else '关闭'}")
+        
     def on_theme_changed(self, theme, state):
         """主题更改事件处理（复选框互斥逻辑）"""
         if state != Qt.CheckState.Checked.value:
@@ -1518,6 +1553,9 @@ class ModernUI(QMainWindow):
         self.settings.setValue("custom_dict_enabled", self.custom_dict_cb.isChecked())
         self.settings.setValue("custom_dict_entries", self.custom_dict_edit.toPlainText())
         self.settings.setValue("custom_dict_apply_type", self.custom_dict_type_combo.currentData())
+
+        # 保存PDF校对模式设置
+        self.settings.setValue("pdf_highlight", self.highlight_pdf_cb.isChecked())
 
     def create_conversion_tab(self):
         """创建转换选项卡"""
@@ -2158,6 +2196,7 @@ class ModernUI(QMainWindow):
         # 获取转换选项的实际值
         preserve_format = self.preserve_format_cb.isChecked()
         convert_footnotes = self.convert_footnotes_cb.isChecked()
+        highlight_pdf = self.highlight_pdf_cb.isChecked()
 
         # 获取强制编码选项
         force_encoding = self.encoding_combo.currentData()
@@ -2229,7 +2268,7 @@ class ModernUI(QMainWindow):
             'jieba_modern': '结巴分词（现代汉语）',
             'jieba_ancient': '结巴分词（古汉语）'
         }
-        self.append_log(f"转换设置：保留格式={preserve_format}，转换脚注={convert_footnotes}，强制编码={force_encoding or '自动'}，分词模式={segment_mode_display.get(segment_mode, '不分词')}，自定义转换表={custom_dict_display}")
+        self.append_log(f"转换设置：保留格式={preserve_format}，转换脚注={convert_footnotes}，强制编码={force_encoding or '自动'}，分词模式={segment_mode_display.get(segment_mode, '不分词')}，自定义转换表={custom_dict_display}，PDF修改字高亮={'开' if highlight_pdf else '关'}")
 
         try:
             self.worker = ConversionWorker(
@@ -2241,7 +2280,8 @@ class ModernUI(QMainWindow):
                 force_encoding,
                 segment_mode,
                 input_paths=self.selected_files if self.selected_files else None,
-                custom_config_path=custom_config_path
+                custom_config_path=custom_config_path,
+                highlight_pdf=highlight_pdf
             )
         except Exception as e:
             # 如果线程启动失败，清理已生成的临时配置文件并提示
