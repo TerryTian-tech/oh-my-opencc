@@ -1720,7 +1720,7 @@ class ModernUI(QMainWindow):
         </ul>
         <p><b>请从以下页面获取本工具最新版本：</p>
         <ul>
-              <p>主仓库（Github）： https://github.com/TerryTian-tech/OpenCC-DocxConverter
+              <p>主仓库（Github）： https://github.com/TerryTian-tech/oh-my-opencc
               <p>镜像1（Gitee）：https://gitee.com/terrytian-tech/opencc-docx-converter
               <p>镜像2（GitCode）：https://gitcode.com/TerryTian-tech/OpenCC-DocxConverter
         </ul>
