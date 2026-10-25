@@ -15,7 +15,7 @@ class UpdateChecker(QThread):
 
     def run(self):
         try:
-            url = "https://api.github.com/repos/TerryTian-tech/OpenCC-DocxConverter/releases/latest"
+            url = "https://api.github.com/repos/TerryTian-tech/oh-my-opencc/releases/latest"
             ssl_context = ssl.create_default_context(cafile=certifi.where())
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, context=ssl_context, timeout=5) as response:
