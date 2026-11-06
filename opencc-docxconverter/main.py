@@ -51,6 +51,9 @@ CONVERSION_TYPES = {
     "小篆（Unicode 18.0 篆书区块）到繁体汉字": "seal2t"
 }
 
+# 支持转换的文件扩展名（文件夹模式下仅处理这些扩展名的顶层文件）
+SUPPORTED_FILE_EXTENSIONS = ['.docx', '.txt', '.md', '.srt', '.ass', '.ssa', '.lrc', '.epub', '.pdf']
+
 # 小篆显示字体：AGPL 授权，不随本软件分发，需用户自行安装到系统
 SEAL_FONT_FAMILY = "Seal Sans"
 
@@ -413,7 +416,7 @@ class ConversionWorker(QThread):
                     return False
 
                 file_ext = os.path.splitext(f)[1].lower()
-                if file_ext in ['.docx', '.txt', '.md', '.srt', '.ass', '.ssa', '.lrc', '.epub', '.pdf']:
+                if file_ext in SUPPORTED_FILE_EXTENSIONS:
                     supported_files.append(f)
 
             if not supported_files:
@@ -2169,6 +2172,30 @@ class ModernUI(QMainWindow):
         if path:
             self.output_edit.setText(path)
 
+    def _find_overwrite_conflicts(self, input_path, output_folder):
+        """收集输出路径下已存在、且将被本次转换覆盖的 convert_ 文件"""
+        conflicts = []
+
+        def check(file_path):
+            basename = os.path.basename(file_path)
+            if os.path.splitext(basename)[1].lower() in SUPPORTED_FILE_EXTENSIONS:
+                output_file = os.path.join(output_folder, f"convert_{basename}")
+                if os.path.exists(output_file) and output_file not in conflicts:
+                    conflicts.append(output_file)
+
+        if self.selected_files:
+            # 多文件模式
+            for file_path in self.selected_files:
+                check(file_path)
+        elif os.path.isfile(input_path):
+            check(input_path)
+        elif os.path.isdir(input_path):
+            # 文件夹模式：与转换逻辑一致，仅统计支持扩展名的顶层文件
+            for filename in os.listdir(input_path):
+                check(os.path.join(input_path, filename))
+
+        return conflicts
+
     def start_conversion(self):
         """开始转换"""
         input_path = self.input_edit.text()
@@ -2188,6 +2215,25 @@ class ModernUI(QMainWindow):
         else:
             if not os.path.exists(input_path):
                 QMessageBox.critical(self, "错误", "输入路径不存在")
+                return
+
+        # 检查输出路径下是否已存在同名的转换结果文件，提示用户确认后再覆盖
+        conflicts = self._find_overwrite_conflicts(input_path, output_path)
+        if conflicts:
+            preview = "\n".join(os.path.basename(f) for f in conflicts[:10])
+            if len(conflicts) > 10:
+                preview += f"\n…（共 {len(conflicts)} 个文件）"
+            msg_box = QMessageBox(
+                QMessageBox.Question,
+                "存在同名文件",
+                f"输出路径下已存在 {len(conflicts)} 个与本次转换结果同名的文件：\n\n"
+                f"{preview}\n\n是否覆盖？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                self
+            )
+            msg_box.button(QMessageBox.StandardButton.Yes).setText("覆盖")
+            msg_box.button(QMessageBox.StandardButton.No).setText("取消")
+            if msg_box.exec() != QMessageBox.StandardButton.Yes:
                 return
 
         # 获取转换类型
