@@ -217,7 +217,7 @@ OpenCC-DocxConverter/
 | [lxml](https://github.com/lxml/lxml) | 6.1.3 | 大型文档和 XML 处理库 |
 | [pdf-oxide](https://pypi.org/project/pdf-oxide/) | 0.3.78 | PDF 文件解析与重建库 |
 | [Pillow](https://python-pillow.github.io/) | 13.0.0 | 图像处理库，用于 PDF 扫描页栅格化保留 |
-| [OpenCC-Traditional Chinese to Traditional Chinese (The Chinese Government Standard)](https://github.com/TerryTian-tech/OpenCC-Traditional-Chinese-characters-according-to-Chinese-government-standards) | 1.4.5 | 《通用规范汉字表》标准转换词典 |
+| [OpenCC-Traditional Chinese to Traditional Chinese (The Chinese Government Standard)](https://github.com/TerryTian-tech/OpenCC-Traditional-Chinese-characters-according-to-Chinese-government-standards) | 1.4.8 | 《通用规范汉字表》标准转换词典 |
 
 ## 隐私与安全
 
