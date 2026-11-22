@@ -104,13 +104,15 @@ def utf16_positions(text):
     return positions
 
 
-def collect_supported_files(input_path, exclude_path=None):
+def collect_supported_files(input_path, exclude_path=None, extensions=None):
     """递归收集文件夹（含子文件夹）中所有支持转换的文件
 
     返回相对 input_path 的相对路径列表：先列当前文件夹的文件，再依次进入各子文件夹，均按名称排序。
     exclude_path 用于跳过嵌套在输入文件夹内的输出文件夹，避免重复转换已有结果。
+    extensions 用于只收集指定的扩展名列表（如 ['.txt', '.docx']），None 表示全部支持的类型。
     """
     exclude = os.path.normcase(os.path.abspath(exclude_path)) if exclude_path else None
+    allowed = SUPPORTED_FILE_EXTENSIONS if extensions is None else extensions
     rel_files = []
     for root, dirs, files in os.walk(input_path):
         # 原地修改 dirs 以控制后续遍历：按名称排序，并剪掉输出文件夹所在的分支
@@ -118,7 +120,7 @@ def collect_supported_files(input_path, exclude_path=None):
                           if not exclude or os.path.normcase(os.path.abspath(os.path.join(root, d))) != exclude),
                          key=str.lower)
         for f in sorted(files, key=str.lower):
-            if os.path.splitext(f)[1].lower() in SUPPORTED_FILE_EXTENSIONS:
+            if os.path.splitext(f)[1].lower() in allowed:
                 rel_files.append(os.path.relpath(os.path.join(root, f), input_path))
     return rel_files
 
@@ -132,7 +134,8 @@ class ConversionWorker(QThread):
 
     def __init__(self, input_path, output_folder, conversion_type='s2t', preserve_format=True,
                  convert_footnotes=True, force_encoding=None, segment_mode=None, input_paths=None,
-                 custom_config_path=None, highlight_pdf=False):
+                 custom_config_path=None, highlight_pdf=False, folder_extensions=None,
+                 keep_original_name=False):
         super().__init__()
         self.input_path = input_path
         self.output_folder = output_folder
@@ -144,6 +147,10 @@ class ConversionWorker(QThread):
         self.input_paths = input_paths
         self.custom_config_path = custom_config_path
         self.highlight_pdf = highlight_pdf
+        # 文件夹批量模式：None 表示转换全部支持类型，列表表示只转换这些扩展名
+        self.folder_extensions = folder_extensions
+        # 文件夹批量模式：输出文件夹与输入文件夹不同时，输出文件名与原文件名一致（不加 convert_ 前缀）
+        self.keep_original_name = keep_original_name
         self._is_cancelled = False
 
     def run(self):
@@ -200,6 +207,18 @@ class ConversionWorker(QThread):
         """取消转换"""
         self._is_cancelled = True
         self.log_message.emit("用户取消转换")
+
+    def _keep_original_filename(self, file_path, output_folder):
+        """文件夹批量模式下，判断该文件输出时是否与原文件同名（不加 convert_ 前缀）。
+
+        仅当设置了"文件名与原文件一致"且该文件的输出目录与其源目录不同时生效；
+        输出目录与源目录相同时仍加前缀，避免覆盖原文件。
+        """
+        if not self.keep_original_name:
+            return False
+        src_dir = os.path.normcase(os.path.abspath(os.path.dirname(file_path)))
+        dst_dir = os.path.normcase(os.path.abspath(output_folder))
+        return src_dir != dst_dir
 
     def process_files(self):
         """处理文件的主要逻辑"""
@@ -427,15 +446,21 @@ class ConversionWorker(QThread):
 
         # 处理文件夹
         elif os.path.isdir(self.input_path):
-            # 递归获取所有支持的文件（含子文件夹），返回相对输入文件夹的路径
-            supported_files = collect_supported_files(self.input_path, exclude_path=self.output_folder)
+            # 递归获取所有支持的文件（含子文件夹），返回相对输入文件夹的路径；
+            # 设置了"只转换指定类型"时按指定扩展名过滤
+            supported_files = collect_supported_files(self.input_path, exclude_path=self.output_folder,
+                                                      extensions=self.folder_extensions)
 
             # 检查是否已取消
             if self._is_cancelled:
                 return False
 
             if not supported_files:
-                self.log_message.emit("在指定文件夹（含子文件夹）中未找到支持的docx、txt、md、srt、ass、ssa、lrc、epub、pdf文件")
+                if self.folder_extensions is not None:
+                    exts_display = '、'.join(e.lstrip('.') for e in self.folder_extensions)
+                    self.log_message.emit(f"在指定文件夹（含子文件夹）中未找到指定类型的文件（{exts_display}）")
+                else:
+                    self.log_message.emit("在指定文件夹（含子文件夹）中未找到支持的docx、txt、md、srt、ass、ssa、lrc、epub、pdf文件")
                 return False
 
             self.log_message.emit(f"找到 {len(supported_files)} 个文件待处理")
@@ -455,6 +480,8 @@ class ConversionWorker(QThread):
                 file_ext = os.path.splitext(filename)[1].lower()
                 # 在输出文件夹中保留与输入相同的子文件夹结构，避免不同子文件夹中的同名文件互相覆盖
                 output_folder = os.path.normpath(os.path.join(self.output_folder, os.path.dirname(filename)))
+                # 该文件输出时是否与原文件同名（仅文件夹批量模式生效）
+                keep_name = self._keep_original_filename(file_path, output_folder)
 
                 if file_ext == '.docx':
                     # 对于docx文件，使用转换器类
@@ -464,7 +491,8 @@ class ConversionWorker(QThread):
                             self.preserve_format,
                             self.convert_footnotes,
                             lambda msg: self.log_message.emit(msg),
-                            lambda: self._is_cancelled
+                            lambda: self._is_cancelled,
+                            keep_original_name=keep_name
                         )
                         if result:
                             success_count += 1
@@ -478,7 +506,8 @@ class ConversionWorker(QThread):
                         lambda msg: self.log_message.emit(msg),
                         lambda: self._is_cancelled,
                         self.force_encoding,
-                        self.segment_mode
+                        self.segment_mode,
+                        keep_original_name=keep_name
                     ):
                         success_count += 1
 
@@ -486,7 +515,8 @@ class ConversionWorker(QThread):
                     if convert_txt_file(
                         file_path, output_folder, self.conversion_type,
                         lambda msg: self.log_message.emit(msg),
-                        lambda: self._is_cancelled
+                        lambda: self._is_cancelled,
+                        keep_original_name=keep_name
                     ):
                         success_count += 1
 
@@ -494,7 +524,8 @@ class ConversionWorker(QThread):
                     if convert_srt_file(
                         file_path, output_folder, self.conversion_type,
                         lambda msg: self.log_message.emit(msg),
-                        lambda: self._is_cancelled
+                        lambda: self._is_cancelled,
+                        keep_original_name=keep_name
                     ):
                         success_count += 1
 
@@ -502,7 +533,8 @@ class ConversionWorker(QThread):
                     if convert_ass_file(
                         file_path, output_folder, self.conversion_type,
                         lambda msg: self.log_message.emit(msg),
-                        lambda: self._is_cancelled
+                        lambda: self._is_cancelled,
+                        keep_original_name=keep_name
                     ):
                         success_count += 1
 
@@ -510,7 +542,8 @@ class ConversionWorker(QThread):
                     if convert_lrc_file(
                         file_path, output_folder, self.conversion_type,
                         lambda msg: self.log_message.emit(msg),
-                        lambda: self._is_cancelled
+                        lambda: self._is_cancelled,
+                        keep_original_name=keep_name
                     ):
                         success_count += 1
                 elif file_ext == '.epub':
@@ -518,7 +551,8 @@ class ConversionWorker(QThread):
                         if convert_epub_file(
                             file_path, output_folder, self.conversion_type,
                             lambda msg: self.log_message.emit(msg),
-                            lambda: self._is_cancelled
+                            lambda: self._is_cancelled,
+                            keep_original_name=keep_name
                         ):
                             success_count += 1
                     except Exception as e:
@@ -530,7 +564,8 @@ class ConversionWorker(QThread):
                             file_path, output_folder, self.conversion_type,
                             lambda msg: self.log_message.emit(msg),
                             lambda: self._is_cancelled,
-                            self.highlight_pdf
+                            self.highlight_pdf,
+                            keep_original_name=keep_name
                         ):
                             success_count += 1
                     except Exception as e:
@@ -1105,6 +1140,74 @@ class ModernUI(QMainWindow):
 
         layout.addWidget(pdf_group)
 
+        # 批量转换设置区域
+        batch_group = QGroupBox("批量转换设置")
+        batch_group_layout = QVBoxLayout(batch_group)
+        batch_group_layout.setSpacing(15)
+        batch_group_layout.setContentsMargins(15, 20, 15, 15)
+
+        # 批量转换说明
+        batch_desc = QLabel(
+            "以下设置仅在\"文件转换\"页选择文件夹批量转换时生效。"
+        )
+        batch_desc.setWordWrap(True)
+        batch_group_layout.addWidget(batch_desc)
+
+        # 文件类型范围选项（复选框互斥：勾选一个自动取消另一个）
+        self.batch_all_types_cb = QCheckBox("选择转换文件夹时，转换文件夹内所有支持的文件类型（默认）")
+        self.batch_all_types_cb.setChecked(True)
+        self.batch_all_types_cb.stateChanged.connect(lambda state: self.on_batch_type_mode_changed("all", state))
+
+        self.batch_custom_types_cb = QCheckBox("选择转换文件夹时，只转换指定的文件类型：")
+        self.batch_custom_types_cb.stateChanged.connect(lambda state: self.on_batch_type_mode_changed("custom", state))
+
+        batch_group_layout.addWidget(self.batch_all_types_cb)
+        batch_group_layout.addWidget(self.batch_custom_types_cb)
+
+        # 指定文件类型的扩展名复选框（仅勾选"只转换指定的文件类型"时可用）
+        batch_types_layout = QHBoxLayout()
+        batch_types_layout.setContentsMargins(20, 0, 0, 0)
+        batch_types_layout.setSpacing(10)
+        # 复选框显示名 -> 对应扩展名列表（ASS/SSA 共用一个选项）
+        batch_type_options = [
+            ("DOCX", ['.docx']), ("TXT", ['.txt']), ("MD", ['.md']), ("SRT", ['.srt']),
+            ("ASS/SSA", ['.ass', '.ssa']), ("LRC", ['.lrc']), ("EPUB", ['.epub']), ("PDF", ['.pdf']),
+        ]
+        self.batch_type_checkboxes = {}
+        for display, exts in batch_type_options:
+            cb = QCheckBox(display)
+            cb.setChecked(True)
+            cb.stateChanged.connect(self.on_batch_custom_type_changed)
+            batch_types_layout.addWidget(cb)
+            self.batch_type_checkboxes[display] = (cb, exts)
+        batch_types_layout.addStretch()
+        batch_group_layout.addLayout(batch_types_layout)
+
+        # 输出文件名选项
+        self.keep_original_name_cb = QCheckBox("输出路径与输入路径不同时，转换后的文件名与原文件名一致")
+        self.keep_original_name_cb.setToolTip(
+            "仅文件夹批量转换生效：输出路径与该文件所在路径不同时，输出文件与原文件同名（不加 convert_ 前缀）；\n"
+            "输出到原路径时仍加 convert_ 前缀，避免覆盖原文件。"
+        )
+        self.keep_original_name_cb.stateChanged.connect(self.on_keep_original_name_changed)
+        batch_group_layout.addWidget(self.keep_original_name_cb)
+
+        # 从设置中恢复批量转换设置
+        saved_all_types = self.settings.value("batch_convert_all_types", True, type=bool)
+        saved_custom_types = self.settings.value("batch_custom_types")
+        # 单元素列表可能读回字符串，统一转为列表，并过滤无效扩展名
+        if isinstance(saved_custom_types, str):
+            saved_custom_types = [saved_custom_types]
+        if not saved_custom_types:
+            saved_custom_types = list(SUPPORTED_FILE_EXTENSIONS)
+        saved_custom_types = [e for e in saved_custom_types if e in SUPPORTED_FILE_EXTENSIONS]
+        for cb, exts in self.batch_type_checkboxes.values():
+            cb.setChecked(any(e in saved_custom_types for e in exts))
+        self._apply_batch_type_mode("all" if saved_all_types else "custom")
+        self.keep_original_name_cb.setChecked(self.settings.value("keep_original_filename", False, type=bool))
+
+        layout.addWidget(batch_group)
+
         layout.addStretch()
         return tab
 
@@ -1211,7 +1314,57 @@ class ModernUI(QMainWindow):
         self.settings.setValue("pdf_highlight", checked)
         self.statusBar().showMessage(
             f"PDF校对模式（修改字黄色高亮）已{'开启' if checked else '关闭'}")
-        
+
+    def _apply_batch_type_mode(self, mode):
+        """应用批量转换文件类型范围设置（互斥勾选）"""
+        self.batch_all_types_cb.setChecked(False)
+        self.batch_custom_types_cb.setChecked(False)
+
+        if mode == "custom":
+            self.batch_custom_types_cb.setChecked(True)
+        else:
+            self.batch_all_types_cb.setChecked(True)
+
+    def _checked_batch_types(self):
+        """返回批量转换中当前勾选的扩展名列表"""
+        exts = []
+        for cb, option_exts in self.batch_type_checkboxes.values():
+            if cb.isChecked():
+                exts.extend(option_exts)
+        return exts
+
+    def on_batch_type_mode_changed(self, mode, state):
+        """批量转换文件类型范围更改事件处理（复选框互斥逻辑）"""
+        if state != Qt.CheckState.Checked.value:
+            return
+
+        # 互斥：勾选一个时取消另一个
+        if mode == "all":
+            self.batch_custom_types_cb.setChecked(False)
+        else:
+            self.batch_all_types_cb.setChecked(False)
+
+        # 扩展名复选框仅在"只转换指定的文件类型"时可用
+        custom = mode == "custom"
+        for cb, _exts in self.batch_type_checkboxes.values():
+            cb.setEnabled(custom)
+
+        # 保存设置
+        self.settings.setValue("batch_convert_all_types", not custom)
+        self.statusBar().showMessage(
+            f"批量转换设置已更改为: {'只转换指定的文件类型' if custom else '转换所有支持的文件类型'}")
+
+    def on_batch_custom_type_changed(self, state):
+        """批量转换指定文件类型勾选项更改事件处理"""
+        self.settings.setValue("batch_custom_types", self._checked_batch_types())
+
+    def on_keep_original_name_changed(self, state):
+        """输出文件名与原文件一致设置更改事件处理"""
+        checked = self.keep_original_name_cb.isChecked()
+        self.settings.setValue("keep_original_filename", checked)
+        self.statusBar().showMessage(
+            f"批量转换输出文件名已更改为: {'与原文件名一致' if checked else '加 convert_ 前缀'}")
+
     def on_theme_changed(self, theme, state):
         """主题更改事件处理（复选框互斥逻辑）"""
         if state != Qt.CheckState.Checked.value:
@@ -1576,6 +1729,11 @@ class ModernUI(QMainWindow):
 
         # 保存PDF校对模式设置
         self.settings.setValue("pdf_highlight", self.highlight_pdf_cb.isChecked())
+
+        # 保存批量转换设置
+        self.settings.setValue("batch_convert_all_types", self.batch_all_types_cb.isChecked())
+        self.settings.setValue("batch_custom_types", self._checked_batch_types())
+        self.settings.setValue("keep_original_filename", self.keep_original_name_cb.isChecked())
 
     def create_conversion_tab(self):
         """创建转换选项卡"""
@@ -2197,13 +2355,20 @@ class ModernUI(QMainWindow):
             self.output_edit.setText(path)
 
     def _find_overwrite_conflicts(self, input_path, output_folder):
-        """收集输出路径下已存在、且将被本次转换覆盖的 convert_ 文件"""
+        """收集输出路径下已存在、且将被本次转换覆盖的转换结果文件"""
         conflicts = []
+        folder_mode = not self.selected_files and os.path.isdir(input_path)
 
         def check(file_path, target_folder):
             basename = os.path.basename(file_path)
             if os.path.splitext(basename)[1].lower() in SUPPORTED_FILE_EXTENSIONS:
-                output_file = os.path.join(target_folder, f"convert_{basename}")
+                # 文件夹批量模式勾选了"文件名与原文件一致"且输出目录与源目录不同时，
+                # 输出与原文件同名（不加前缀），预测覆盖时需与实际命名规则一致
+                src_dir = os.path.normcase(os.path.abspath(os.path.dirname(file_path)))
+                dst_dir = os.path.normcase(os.path.abspath(target_folder))
+                prefix = "" if (folder_mode and self.keep_original_name_cb.isChecked()
+                                and src_dir != dst_dir) else "convert_"
+                output_file = os.path.join(target_folder, f"{prefix}{basename}")
                 if os.path.exists(output_file) and output_file not in conflicts:
                     conflicts.append(output_file)
 
@@ -2213,9 +2378,13 @@ class ModernUI(QMainWindow):
                 check(file_path, output_folder)
         elif os.path.isfile(input_path):
             check(input_path, output_folder)
-        elif os.path.isdir(input_path):
-            # 文件夹模式：与转换逻辑一致，递归统计支持扩展名的文件，输出位置保留子文件夹结构
-            for rel_path in collect_supported_files(input_path, exclude_path=output_folder):
+        elif folder_mode:
+            # 文件夹模式：与转换逻辑一致，递归统计支持扩展名的文件（按指定类型过滤），输出位置保留子文件夹结构
+            folder_extensions = None
+            if self.batch_custom_types_cb.isChecked():
+                folder_extensions = self._checked_batch_types()
+            for rel_path in collect_supported_files(input_path, exclude_path=output_folder,
+                                                    extensions=folder_extensions):
                 target_folder = os.path.normpath(os.path.join(output_folder, os.path.dirname(rel_path)))
                 check(os.path.join(input_path, rel_path), target_folder)
 
@@ -2241,6 +2410,12 @@ class ModernUI(QMainWindow):
             if not os.path.exists(input_path):
                 QMessageBox.critical(self, "错误", "输入路径不存在")
                 return
+
+        # 文件夹批量模式勾选了"只转换指定的文件类型"但未勾选任何类型时，提前提示
+        if (not self.selected_files and os.path.isdir(input_path)
+                and self.batch_custom_types_cb.isChecked() and not self._checked_batch_types()):
+            QMessageBox.warning(self, "警告", "已选择\"只转换指定的文件类型\"，但未勾选任何文件类型")
+            return
 
         # 检查输出路径下是否已存在同名的转换结果文件，提示用户确认后再覆盖
         conflicts = self._find_overwrite_conflicts(input_path, output_path)
@@ -2280,6 +2455,14 @@ class ModernUI(QMainWindow):
             segment_mode = 'jieba_ancient'
         else:
             segment_mode = None
+
+        # 获取文件夹批量转换的文件类型范围（None 表示全部支持类型）
+        folder_extensions = None
+        if not self.selected_files and os.path.isdir(input_path) and self.batch_custom_types_cb.isChecked():
+            folder_extensions = self._checked_batch_types()
+
+        # 获取文件夹批量模式的输出文件名设置（仅文件夹模式生效）
+        keep_original_name = self.keep_original_name_cb.isChecked()
 
         # 根据分词模式自动调整OpenCC配置名称
         if segment_mode == 'jieba_modern':
@@ -2342,6 +2525,13 @@ class ModernUI(QMainWindow):
         }
         self.append_log(f"转换设置：保留格式={preserve_format}，转换脚注={convert_footnotes}，强制编码={force_encoding or '自动'}，分词模式={segment_mode_display.get(segment_mode, '不分词')}，自定义转换表={custom_dict_display}，PDF修改字高亮={'开' if highlight_pdf else '关'}")
 
+        # 文件夹批量模式下补充显示批量转换设置
+        if os.path.isdir(input_path) and not self.selected_files:
+            batch_types_display = ('全部支持类型' if folder_extensions is None
+                                   else '仅 ' + '、'.join(e.lstrip('.') for e in folder_extensions))
+            self.append_log(f"批量转换设置：文件类型={batch_types_display}，"
+                            f"输出文件名={'与原文件一致（输出路径与输入不同时）' if keep_original_name else '加 convert_ 前缀'}")
+
         try:
             self.worker = ConversionWorker(
                 input_path,
@@ -2353,7 +2543,9 @@ class ModernUI(QMainWindow):
                 segment_mode,
                 input_paths=self.selected_files if self.selected_files else None,
                 custom_config_path=custom_config_path,
-                highlight_pdf=highlight_pdf
+                highlight_pdf=highlight_pdf,
+                folder_extensions=folder_extensions,
+                keep_original_name=keep_original_name
             )
         except Exception as e:
             # 如果线程启动失败，清理已生成的临时配置文件并提示
